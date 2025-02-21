@@ -1,0 +1,45 @@
+# Build directories
+/build/
+/bin/
+/lib/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Object files, libraries, and executables
+*.o
+*.obj
+*.lo
+*.slo
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# Debug files
+*.dSYM/
+
+# IDE and editor specific files
+*.user
+*.userprefs
+*.sublime-workspace
+*.sublime-project
+*.vcxproj
+*.vcxproj.filters
+*.ncb
+*.suo
+*.opensdf
+*.sln
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.swp
+*.tmp
