@@ -13,8 +13,9 @@ done
 # Variables
 WLAN_IFACE="wlp0s20f3"    # Primary Wi-Fi interface
 AP_IFACE="ap0"            # Virtual interface for hotspot
-SSID="MyHotspot"
-PASS="MyPassword"
+read -p "Enter SSID for Hotspot: " SSID
+read -sp "Enter Password for hotspot(min 8 char): " PASS
+echo ""
 
 # Ensure NetworkManager is running
 echo "Starting NetworkManager..."
