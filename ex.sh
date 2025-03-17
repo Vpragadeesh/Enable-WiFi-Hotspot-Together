@@ -13,8 +13,10 @@ done
 # Variables
 WLAN_IFACE="wlp0s20f3"    # Primary Wi-Fi interface
 AP_IFACE="ap0"            # Virtual interface for hotspot
-read -p "Enter SSID for Hotspot: " SSID
-read -sp "Enter Password for hotspot(min 8 char): " PASS
+
+# Prompt user for SSID and Password
+read -p "Enter SSID for hotspot: " SSID
+read -s -p "Enter Password for hotspot: " PASS
 echo ""
 
 # Ensure NetworkManager is running
@@ -110,7 +112,7 @@ if ! ps -p $HOSTAPD_PID >/dev/null; then
     exit 1
 fi
 
-# Configure IP and start dnsmasq for DHCP
+# Configure IP address and start dnsmasq for DHCP
 echo "Setting up IP and DHCP for $AP_IFACE..."
 sudo ip addr add 192.168.4.1/24 dev "$AP_IFACE"
 sudo ip link set "$AP_IFACE" up
@@ -125,6 +127,17 @@ sudo iptables -A FORWARD -i "$WLAN_IFACE" -o "$AP_IFACE" -m state --state RELATE
 
 echo "Hotspot started on channel $CHANNEL using interface $AP_IFACE. Press Ctrl+C to stop."
 
-# Cleanup on termination
-trap 'echo "Stopping hotspot..."; sudo kill $HOSTAPD_PID; sudo killall dnsmasq; sudo iw dev "$AP_IFACE" del; exit 0' INT
+# Define a cleanup function to stop background processes and remove the AP interface
+cleanup() {
+    echo "Stopping hotspot..."
+    sudo kill $HOSTAPD_PID 2>/dev/null
+    sudo killall dnsmasq 2>/dev/null
+    sudo iw dev "$AP_IFACE" del 2>/dev/null
+    exit 0
+}
+
+# Set trap to call cleanup on INT or TERM
+trap cleanup INT TERM
+
+# Wait indefinitely
 wait
