@@ -6,12 +6,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// Constants for interfaces and config file path.
-#define WLAN_IFACE "wlp0s20f3"
 #define AP_IFACE "ap0"
 #define HOSTAPD_CONF "/tmp/hostapd.conf"
 
-// Global variable to store hostapd PID.
 pid_t hostapd_pid = -1;
 
 // Helper function to run a command and capture its output.
@@ -41,7 +38,6 @@ char *exec_cmd(const char *cmd) {
   return result;
 }
 
-// Cleanup function to be called on SIGINT/SIGTERM.
 void cleanup(int sig) {
   printf("\nStopping hotspot...\n");
   if (hostapd_pid > 0) {
@@ -55,11 +51,10 @@ void cleanup(int sig) {
 }
 
 int main(void) {
-  // Install signal handlers.
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
 
-  // Increase file descriptor limit to 4096.
+  // Increase file descriptor limit.
   struct rlimit rl;
   if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
     rl.rlim_cur = 4096;
@@ -78,6 +73,17 @@ int main(void) {
     }
   }
 
+  // Automatically fetch WLAN interface from OS.
+  char *wlan_iface =
+      exec_cmd("iw dev | grep Interface | awk '{print $2}' | head -n1");
+  if (!wlan_iface || strlen(wlan_iface) == 0) {
+    fprintf(stderr, "No WLAN interface detected.\n");
+    exit(1);
+  }
+  // Remove any trailing newline.
+  wlan_iface[strcspn(wlan_iface, "\n")] = '\0';
+  printf("Detected WLAN interface: %s\n", wlan_iface);
+
   // Prompt user for SSID and Password.
   char ssid[128], pass[128];
   printf("Enter SSID for hotspot: ");
@@ -85,7 +91,7 @@ int main(void) {
     fprintf(stderr, "Error reading SSID\n");
     exit(1);
   }
-  ssid[strcspn(ssid, "\n")] = '\0'; // remove newline
+  ssid[strcspn(ssid, "\n")] = '\0';
 
   printf("Enter Password for hotspot: ");
   if (!fgets(pass, sizeof(pass), stdin)) {
@@ -104,15 +110,15 @@ int main(void) {
   }
 
   // Verify primary wireless connection via nmcli.
-  printf("Checking %s connection...\n", WLAN_IFACE);
+  printf("Checking %s connection...\n", wlan_iface);
   char nmcliCmd[256];
   snprintf(
       nmcliCmd, sizeof(nmcliCmd),
       "nmcli -t -f NAME,DEVICE con show --active | grep \"%s\" | cut -d: -f1",
-      WLAN_IFACE);
+      wlan_iface);
   char *connection = exec_cmd(nmcliCmd);
   if (!connection || strlen(connection) == 0) {
-    fprintf(stderr, "Error: %s not connected.\n", WLAN_IFACE);
+    fprintf(stderr, "Error: %s not connected.\n", wlan_iface);
     system("nmcli dev status");
     exit(1);
   }
@@ -120,7 +126,7 @@ int main(void) {
 
   // Extract channel and frequency info using iw.
   char iwCmd[256];
-  snprintf(iwCmd, sizeof(iwCmd), "iw dev %s info", WLAN_IFACE);
+  snprintf(iwCmd, sizeof(iwCmd), "iw dev %s info", wlan_iface);
   char *wlanInfo = exec_cmd(iwCmd);
   if (!wlanInfo) {
     fprintf(stderr, "Failed to get wireless info\n");
@@ -129,11 +135,9 @@ int main(void) {
   char channel[16] = {0};
   char freq[16] = {0};
   {
-    // Parse each line to find one with "channel"
     char *line = strtok(wlanInfo, "\n");
     while (line) {
       if (strstr(line, "channel")) {
-        // Assume line looks like: " channel 36 (5180 MHz)"
         sscanf(line, " channel %15s", channel);
         char *paren = strchr(line, '(');
         if (paren) {
@@ -155,7 +159,6 @@ int main(void) {
   printf("Primary connection - Channel: %s, Frequency: %s MHz\n", channel,
          freq);
 
-  // Verify the frequency is 5 GHz.
   int freqVal = atoi(freq);
   if (freqVal < 5000) {
     fprintf(stderr, "Error: Primary connection is on 2.4 GHz. Please use a 5 "
@@ -163,7 +166,6 @@ int main(void) {
     exit(1);
   }
 
-  // Set hardware mode based on frequency.
   const char *hw_mode = "a";
   printf("Using hardware mode: %s\n", hw_mode);
 
@@ -182,7 +184,7 @@ int main(void) {
   printf("Creating %s...\n", AP_IFACE);
   char addIf[256];
   snprintf(addIf, sizeof(addIf), "sudo iw dev %s interface add %s type __ap",
-           WLAN_IFACE, AP_IFACE);
+           wlan_iface, AP_IFACE);
   if (system(addIf) != 0) {
     fprintf(stderr, "Failed to create AP interface %s\n", AP_IFACE);
     exit(1);
@@ -210,7 +212,7 @@ int main(void) {
   }
   free(connection);
 
-  // Write hostapd configuration to file.
+  // Write hostapd configuration.
   printf("Configuring hostapd...\n");
   FILE *fp = fopen(HOSTAPD_CONF, "w");
   if (!fp) {
@@ -231,17 +233,15 @@ int main(void) {
           AP_IFACE, ssid, hw_mode, channel, pass);
   fclose(fp);
 
-  // Stop any existing dnsmasq.
   if (system("pgrep dnsmasq >/dev/null 2>&1") == 0) {
     printf("Stopping existing dnsmasq...\n");
     system("sudo killall dnsmasq");
   }
 
-  // Start hostapd in the background.
+  // Start hostapd.
   printf("Starting hostapd...\n");
   hostapd_pid = fork();
   if (hostapd_pid == 0) {
-    // In child process, execute hostapd.
     execlp("sudo", "sudo", "hostapd", HOSTAPD_CONF, NULL);
     perror("execlp hostapd failed");
     exit(1);
@@ -256,7 +256,6 @@ int main(void) {
     exit(1);
   }
 
-  // Configure IP address and start dnsmasq.
   printf("Setting up IP and DHCP for %s...\n", AP_IFACE);
   char ipCmd[128];
   snprintf(ipCmd, sizeof(ipCmd), "sudo ip addr add 192.168.4.1/24 dev %s",
@@ -272,32 +271,31 @@ int main(void) {
            AP_IFACE);
   system(dnsCmd);
 
-  // Enable NAT for internet sharing.
   printf("Enabling NAT...\n");
   system("sudo sysctl -w net.ipv4.ip_forward=1");
   char iptCmd[256];
   snprintf(iptCmd, sizeof(iptCmd),
            "sudo iptables -t nat -A POSTROUTING -o %s -j MASQUERADE",
-           WLAN_IFACE);
+           wlan_iface);
   system(iptCmd);
   snprintf(iptCmd, sizeof(iptCmd),
            "sudo iptables -A FORWARD -i %s -o %s -j ACCEPT", AP_IFACE,
-           WLAN_IFACE);
+           wlan_iface);
   system(iptCmd);
   snprintf(iptCmd, sizeof(iptCmd),
            "sudo iptables -A FORWARD -i %s -o %s -m state --state "
            "RELATED,ESTABLISHED -j ACCEPT",
-           WLAN_IFACE, AP_IFACE);
+           wlan_iface, AP_IFACE);
   system(iptCmd);
 
   printf("Hotspot started on channel %s using interface %s. Press Ctrl+C to "
          "stop.\n",
          channel, AP_IFACE);
 
-  // Wait indefinitely.
   while (1) {
     pause();
   }
 
+  free(wlan_iface);
   return 0;
 }
