@@ -8,6 +8,8 @@
 
 #define AP_IFACE "ap0"
 #define HOSTAPD_CONF "/tmp/hostapd.conf"
+#define AP_IP "192.168.4.1/24"
+#define DHCP_RANGE "192.168.4.2,192.168.4.100,12h"
 
 pid_t hostapd_pid = -1;
 
@@ -49,6 +51,25 @@ char *get_cmd_path(const char *cmd) {
   return path;
 }
 
+// Check that dnsmasq is running.
+int check_dnsmasq_running(const char *dnsmasq_path) {
+  char cmd[128];
+  snprintf(cmd, sizeof(cmd), "pgrep -x %s >/dev/null 2>&1", "dnsmasq");
+  return (system(cmd) == 0);
+}
+
+// Check that the AP interface has the expected IP.
+int check_ap_ip(const char *ip_path) {
+  char cmd[128];
+  snprintf(cmd, sizeof(cmd), "%s addr show %s", ip_path, AP_IFACE);
+  char *output = exec_cmd(cmd);
+  if (!output)
+    return 0;
+  int ok = (strstr(output, "192.168.4.1") != NULL);
+  free(output);
+  return ok;
+}
+
 // Cleanup function to be called on SIGINT/SIGTERM.
 void cleanup(int sig) {
   printf("\nStopping hotspot...\n");
@@ -82,14 +103,12 @@ int main(void) {
   char *ip_path = get_cmd_path("ip");
   char *iptables_path = get_cmd_path("iptables");
 
-  // Check that all commands are available.
   if (!iw_path || !hostapd_path || !dnsmasq_path || !nmcli_path ||
       !systemctl_path || !ip_path || !iptables_path) {
     fprintf(stderr, "One or more required tools are missing.\n");
     exit(1);
   }
 
-  // (For debugging purposes, you can print the paths.)
   printf("Found tools:\n");
   printf("iw:         %s\n", iw_path);
   printf("hostapd:    %s\n", hostapd_path);
@@ -99,7 +118,7 @@ int main(void) {
   printf("ip:         %s\n", ip_path);
   printf("iptables:   %s\n", iptables_path);
 
-  // Automatically fetch the connected WLAN interface.
+  // Automatically fetch the connected WLAN interface using nmcli.
   char *wlan_iface = exec_cmd("nmcli -t -f DEVICE,TYPE,STATE dev status | grep "
                               "':wifi:connected' | cut -d: -f1 | head -n1");
   if (!wlan_iface || strlen(wlan_iface) == 0) {
@@ -285,21 +304,35 @@ int main(void) {
     exit(1);
   }
 
-  // Set up IP and DHCP for the AP interface.
+  // Set up IP and bring up the AP interface.
   char ipCmd[128];
-  snprintf(ipCmd, sizeof(ipCmd), "sudo %s addr add 192.168.4.1/24 dev %s",
-           ip_path, AP_IFACE);
+  snprintf(ipCmd, sizeof(ipCmd), "sudo %s addr add %s dev %s", ip_path, AP_IP,
+           AP_IFACE);
   system(ipCmd);
   char linkCmd[128];
   snprintf(linkCmd, sizeof(linkCmd), "sudo %s link set %s up", ip_path,
            AP_IFACE);
   system(linkCmd);
+
+  // Check that the AP interface has the correct IP.
+  if (!check_ap_ip(ip_path)) {
+    fprintf(stderr, "AP interface %s did not receive the correct IP address.\n",
+            AP_IFACE);
+    exit(1);
+  }
+
+  // Start dnsmasq for DHCP.
   char dnsCmd[256];
-  snprintf(
-      dnsCmd, sizeof(dnsCmd),
-      "sudo %s --interface=%s --dhcp-range=192.168.4.2,192.168.4.100,12h &",
-      dnsmasq_path, AP_IFACE);
+  snprintf(dnsCmd, sizeof(dnsCmd), "sudo %s --interface=%s --dhcp-range=%s &",
+           dnsmasq_path, AP_IFACE, DHCP_RANGE);
   system(dnsCmd);
+  sleep(2);
+  if (!check_dnsmasq_running(dnsmasq_path)) {
+    fprintf(stderr, "dnsmasq is not running. DHCP will not work.\n");
+    exit(1);
+  } else {
+    printf("dnsmasq is running and DHCP is enabled.\n");
+  }
 
   // Enable NAT for internet sharing.
   printf("Enabling NAT...\n");
@@ -318,14 +351,15 @@ int main(void) {
            iptables_path, wlan_iface, AP_IFACE);
   system(iptCmd);
 
-  printf("Hotspot started on channel %s using interface %s. Press Ctrl+C to "
-         "stop.\n",
-         channel, AP_IFACE);
+  printf("Hotspot started on channel %s using interface %s.\n", channel,
+         AP_IFACE);
+  printf("Clients should obtain an IP address from dnsmasq.\n");
+  printf("Press Ctrl+C to stop.\n");
+
   while (1) {
     pause();
   }
 
-  // Free allocated command paths.
   free(iw_path);
   free(hostapd_path);
   free(dnsmasq_path);
