@@ -22,7 +22,8 @@ Makefile
 
 # Debug files
 *.dSYM/
-
+exc
+gc
 # IDE and editor specific files
 *.user
 *.userprefs
