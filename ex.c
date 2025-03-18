@@ -38,6 +38,18 @@ char *exec_cmd(const char *cmd) {
   return result;
 }
 
+// Helper function to get full path of a command.
+char *get_cmd_path(const char *cmd) {
+  char buf[256];
+  snprintf(buf, sizeof(buf), "command -v %s", cmd);
+  char *path = exec_cmd(buf);
+  if (path) {
+    path[strcspn(path, "\n")] = '\0'; // Remove newline
+  }
+  return path;
+}
+
+// Cleanup function to be called on SIGINT/SIGTERM.
 void cleanup(int sig) {
   printf("\nStopping hotspot...\n");
   if (hostapd_pid > 0) {
@@ -61,28 +73,41 @@ int main(void) {
     setrlimit(RLIMIT_NOFILE, &rl);
   }
 
-  // Check prerequisites.
-  const char *prereqs[] = {"iw", "hostapd", "dnsmasq", "nmcli"};
-  for (int i = 0; i < 4; i++) {
-    char checkCmd[128];
-    snprintf(checkCmd, sizeof(checkCmd), "command -v %s >/dev/null 2>&1",
-             prereqs[i]);
-    if (system(checkCmd) != 0) {
-      fprintf(stderr, "%s required\n", prereqs[i]);
-      exit(1);
-    }
-  }
+  // Fetch full paths for all required commands.
+  char *iw_path = get_cmd_path("iw");
+  char *hostapd_path = get_cmd_path("hostapd");
+  char *dnsmasq_path = get_cmd_path("dnsmasq");
+  char *nmcli_path = get_cmd_path("nmcli");
+  char *systemctl_path = get_cmd_path("systemctl");
+  char *ip_path = get_cmd_path("ip");
+  char *iptables_path = get_cmd_path("iptables");
 
-  // Automatically fetch WLAN interface from OS.
-  char *wlan_iface =
-      exec_cmd("iw dev | grep Interface | awk '{print $2}' | head -n1");
-  if (!wlan_iface || strlen(wlan_iface) == 0) {
-    fprintf(stderr, "No WLAN interface detected.\n");
+  // Check that all commands are available.
+  if (!iw_path || !hostapd_path || !dnsmasq_path || !nmcli_path ||
+      !systemctl_path || !ip_path || !iptables_path) {
+    fprintf(stderr, "One or more required tools are missing.\n");
     exit(1);
   }
-  // Remove any trailing newline.
+
+  // (For debugging purposes, you can print the paths.)
+  printf("Found tools:\n");
+  printf("iw:         %s\n", iw_path);
+  printf("hostapd:    %s\n", hostapd_path);
+  printf("dnsmasq:    %s\n", dnsmasq_path);
+  printf("nmcli:      %s\n", nmcli_path);
+  printf("systemctl:  %s\n", systemctl_path);
+  printf("ip:         %s\n", ip_path);
+  printf("iptables:   %s\n", iptables_path);
+
+  // Automatically fetch the connected WLAN interface.
+  char *wlan_iface = exec_cmd("nmcli -t -f DEVICE,TYPE,STATE dev status | grep "
+                              "':wifi:connected' | cut -d: -f1 | head -n1");
+  if (!wlan_iface || strlen(wlan_iface) == 0) {
+    fprintf(stderr, "No connected WLAN interface detected.\n");
+    exit(1);
+  }
   wlan_iface[strcspn(wlan_iface, "\n")] = '\0';
-  printf("Detected WLAN interface: %s\n", wlan_iface);
+  printf("Detected connected WLAN interface: %s\n", wlan_iface);
 
   // Prompt user for SSID and Password.
   char ssid[128], pass[128];
@@ -102,20 +127,21 @@ int main(void) {
   printf("\n");
 
   // Start NetworkManager.
+  char nmcli_start[256];
+  snprintf(nmcli_start, sizeof(nmcli_start), "sudo %s start NetworkManager",
+           systemctl_path);
   printf("Starting NetworkManager...\n");
-  system("sudo systemctl start NetworkManager");
+  system(nmcli_start);
   if (system("systemctl is-active NetworkManager >/dev/null 2>&1") != 0) {
     fprintf(stderr, "NetworkManager failed to start\n");
     exit(1);
   }
 
   // Verify primary wireless connection via nmcli.
-  printf("Checking %s connection...\n", wlan_iface);
   char nmcliCmd[256];
-  snprintf(
-      nmcliCmd, sizeof(nmcliCmd),
-      "nmcli -t -f NAME,DEVICE con show --active | grep \"%s\" | cut -d: -f1",
-      wlan_iface);
+  snprintf(nmcliCmd, sizeof(nmcliCmd),
+           "%s -t -f NAME,DEVICE con show --active | grep \"%s\" | cut -d: -f1",
+           nmcli_path, wlan_iface);
   char *connection = exec_cmd(nmcliCmd);
   if (!connection || strlen(connection) == 0) {
     fprintf(stderr, "Error: %s not connected.\n", wlan_iface);
@@ -126,7 +152,7 @@ int main(void) {
 
   // Extract channel and frequency info using iw.
   char iwCmd[256];
-  snprintf(iwCmd, sizeof(iwCmd), "iw dev %s info", wlan_iface);
+  snprintf(iwCmd, sizeof(iwCmd), "%s dev %s info", iw_path, wlan_iface);
   char *wlanInfo = exec_cmd(iwCmd);
   if (!wlanInfo) {
     fprintf(stderr, "Failed to get wireless info\n");
@@ -171,41 +197,43 @@ int main(void) {
 
   // Remove any existing AP interface.
   char checkAP[128];
-  snprintf(checkAP, sizeof(checkAP), "sudo iw dev %s info >/dev/null 2>&1",
-           AP_IFACE);
+  snprintf(checkAP, sizeof(checkAP), "sudo %s dev %s info >/dev/null 2>&1",
+           iw_path, AP_IFACE);
   if (system(checkAP) == 0) {
     printf("Interface %s already exists. Removing it...\n", AP_IFACE);
     char delCmd[128];
-    snprintf(delCmd, sizeof(delCmd), "sudo iw dev %s del", AP_IFACE);
+    snprintf(delCmd, sizeof(delCmd), "sudo %s dev %s del", iw_path, AP_IFACE);
     system(delCmd);
   }
 
   // Create the AP interface.
-  printf("Creating %s...\n", AP_IFACE);
   char addIf[256];
-  snprintf(addIf, sizeof(addIf), "sudo iw dev %s interface add %s type __ap",
-           wlan_iface, AP_IFACE);
+  snprintf(addIf, sizeof(addIf), "sudo %s dev %s interface add %s type __ap",
+           iw_path, wlan_iface, AP_IFACE);
+  printf("Creating %s...\n", AP_IFACE);
   if (system(addIf) != 0) {
     fprintf(stderr, "Failed to create AP interface %s\n", AP_IFACE);
     exit(1);
   }
   char nmcliSet[128];
-  snprintf(nmcliSet, sizeof(nmcliSet), "sudo nmcli dev set %s managed no",
-           AP_IFACE);
+  snprintf(nmcliSet, sizeof(nmcliSet), "sudo %s dev set %s managed no",
+           nmcli_path, AP_IFACE);
   system(nmcliSet);
 
   // Check internet connectivity.
   printf("Checking internet connectivity...\n");
   if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
-    printf("Internet appears down; attempting to reconnect...\n");
     char upConn[256];
-    snprintf(upConn, sizeof(upConn), "sudo nmcli con up \"%s\"", connection);
+    snprintf(upConn, sizeof(upConn), "sudo %s con up \"%s\"", nmcli_path,
+             connection);
+    printf("Internet appears down; attempting to reconnect...\n");
     system(upConn);
     sleep(2);
     if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
       fprintf(stderr, "Failed to restore internet connection.\n");
       char delCmd2[128];
-      snprintf(delCmd2, sizeof(delCmd2), "sudo iw dev %s del", AP_IFACE);
+      snprintf(delCmd2, sizeof(delCmd2), "sudo %s dev %s del", iw_path,
+               AP_IFACE);
       system(delCmd2);
       exit(1);
     }
@@ -233,6 +261,7 @@ int main(void) {
           AP_IFACE, ssid, hw_mode, channel, pass);
   fclose(fp);
 
+  // Stop any existing dnsmasq.
   if (system("pgrep dnsmasq >/dev/null 2>&1") == 0) {
     printf("Stopping existing dnsmasq...\n");
     system("sudo killall dnsmasq");
@@ -242,7 +271,7 @@ int main(void) {
   printf("Starting hostapd...\n");
   hostapd_pid = fork();
   if (hostapd_pid == 0) {
-    execlp("sudo", "sudo", "hostapd", HOSTAPD_CONF, NULL);
+    execlp("sudo", "sudo", hostapd_path, HOSTAPD_CONF, NULL);
     perror("execlp hostapd failed");
     exit(1);
   }
@@ -251,51 +280,59 @@ int main(void) {
     fprintf(stderr, "hostapd failed to start. Configuration:\n");
     system("cat " HOSTAPD_CONF);
     char delCmd3[128];
-    snprintf(delCmd3, sizeof(delCmd3), "sudo iw dev %s del", AP_IFACE);
+    snprintf(delCmd3, sizeof(delCmd3), "sudo %s dev %s del", iw_path, AP_IFACE);
     system(delCmd3);
     exit(1);
   }
 
-  printf("Setting up IP and DHCP for %s...\n", AP_IFACE);
+  // Set up IP and DHCP for the AP interface.
   char ipCmd[128];
-  snprintf(ipCmd, sizeof(ipCmd), "sudo ip addr add 192.168.4.1/24 dev %s",
-           AP_IFACE);
+  snprintf(ipCmd, sizeof(ipCmd), "sudo %s addr add 192.168.4.1/24 dev %s",
+           ip_path, AP_IFACE);
   system(ipCmd);
   char linkCmd[128];
-  snprintf(linkCmd, sizeof(linkCmd), "sudo ip link set %s up", AP_IFACE);
+  snprintf(linkCmd, sizeof(linkCmd), "sudo %s link set %s up", ip_path,
+           AP_IFACE);
   system(linkCmd);
   char dnsCmd[256];
-  snprintf(dnsCmd, sizeof(dnsCmd),
-           "sudo dnsmasq --interface=%s "
-           "--dhcp-range=192.168.4.2,192.168.4.100,12h &",
-           AP_IFACE);
+  snprintf(
+      dnsCmd, sizeof(dnsCmd),
+      "sudo %s --interface=%s --dhcp-range=192.168.4.2,192.168.4.100,12h &",
+      dnsmasq_path, AP_IFACE);
   system(dnsCmd);
 
+  // Enable NAT for internet sharing.
   printf("Enabling NAT...\n");
   system("sudo sysctl -w net.ipv4.ip_forward=1");
   char iptCmd[256];
   snprintf(iptCmd, sizeof(iptCmd),
-           "sudo iptables -t nat -A POSTROUTING -o %s -j MASQUERADE",
+           "sudo %s -t nat -A POSTROUTING -o %s -j MASQUERADE", iptables_path,
            wlan_iface);
   system(iptCmd);
-  snprintf(iptCmd, sizeof(iptCmd),
-           "sudo iptables -A FORWARD -i %s -o %s -j ACCEPT", AP_IFACE,
-           wlan_iface);
+  snprintf(iptCmd, sizeof(iptCmd), "sudo %s -A FORWARD -i %s -o %s -j ACCEPT",
+           iptables_path, AP_IFACE, wlan_iface);
   system(iptCmd);
   snprintf(iptCmd, sizeof(iptCmd),
-           "sudo iptables -A FORWARD -i %s -o %s -m state --state "
+           "sudo %s -A FORWARD -i %s -o %s -m state --state "
            "RELATED,ESTABLISHED -j ACCEPT",
-           wlan_iface, AP_IFACE);
+           iptables_path, wlan_iface, AP_IFACE);
   system(iptCmd);
 
   printf("Hotspot started on channel %s using interface %s. Press Ctrl+C to "
          "stop.\n",
          channel, AP_IFACE);
-
   while (1) {
     pause();
   }
 
+  // Free allocated command paths.
+  free(iw_path);
+  free(hostapd_path);
+  free(dnsmasq_path);
+  free(nmcli_path);
+  free(systemctl_path);
+  free(ip_path);
+  free(iptables_path);
   free(wlan_iface);
   return 0;
 }
