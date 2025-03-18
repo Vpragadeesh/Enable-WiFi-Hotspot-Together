@@ -323,12 +323,15 @@ int main(void) {
 
   // Start dnsmasq for DHCP.
   char dnsCmd[256];
-  snprintf(dnsCmd, sizeof(dnsCmd), "sudo %s --interface=%s --dhcp-range=%s &",
+  snprintf(dnsCmd, sizeof(dnsCmd),
+           "sudo %s --interface=%s --dhcp-range=%s --bind-interfaces &",
            dnsmasq_path, AP_IFACE, DHCP_RANGE);
   system(dnsCmd);
   sleep(2);
   if (!check_dnsmasq_running(dnsmasq_path)) {
     fprintf(stderr, "dnsmasq is not running. DHCP will not work.\n");
+    fprintf(stderr, "Please check for any services (like systemd-resolved) "
+                    "using port 53 and disable them if necessary.\n");
     exit(1);
   } else {
     printf("dnsmasq is running and DHCP is enabled.\n");
