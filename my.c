@@ -70,59 +70,151 @@ int check_ap_ip(const char *ip_path) {
   return ok;
 }
 
-// Reconnection function: if ping fails, list networks and prompt user.
-void check_and_reconnect(const char *nmcli_path) {
-  if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") == 0) {
-    // Internet is connected.
-    return;
+// Retrieve saved Wi-Fi connection names (assumed to match SSIDs)
+char **get_saved_connections(const char *nmcli_path, int *count) {
+  // Use terse nmcli output to list connection names
+  char *saved = exec_cmd("nmcli -t -f NAME connection show");
+  if (!saved) {
+    *count = 0;
+    return NULL;
   }
-
-  printf("\nInternet connectivity lost.\n");
-  printf("Scanning for available Wi-Fi networks...\n");
-  char *wifiList = exec_cmd("nmcli device wifi list");
-  if (wifiList) {
-    printf("%s\n", wifiList);
-    free(wifiList);
-  } else {
-    fprintf(stderr, "Failed to retrieve Wi-Fi network list.\n");
+  // Count lines
+  int lines = 0;
+  for (char *p = saved; *p; p++) {
+    if (*p == '\n')
+      lines++;
   }
-
-  printf("Saved Wi-Fi connections:\n");
-  char *savedList = exec_cmd("nmcli connection show");
-  if (savedList) {
-    printf("%s\n", savedList);
-    free(savedList);
-  } else {
-    fprintf(stderr, "Failed to retrieve saved Wi-Fi connections.\n");
+  char **list = malloc(sizeof(char *) * lines);
+  if (!list) {
+    free(saved);
+    *count = 0;
+    return NULL;
   }
-
-  // Prompt user to enter the name (connection ID) of a network to switch to.
-  char chosen[128];
-  printf("Enter the name of the Wi-Fi network to connect to: ");
-  if (!fgets(chosen, sizeof(chosen), stdin)) {
-    fprintf(stderr, "Error reading input.\n");
-    exit(1);
+  int idx = 0;
+  char *line = strtok(saved, "\n");
+  while (line && idx < lines) {
+    list[idx] = strdup(line);
+    idx++;
+    line = strtok(NULL, "\n");
   }
-  chosen[strcspn(chosen, "\n")] = '\0';
+  *count = idx;
+  free(saved);
+  return list;
+}
 
+// Retrieve available Wi-Fi networks: returns an array of structures (SSID and
+// signal)
+typedef struct {
+  char ssid[128];
+  int signal;
+} WifiEntry;
+
+WifiEntry *get_available_networks(const char *nmcli_path, int *count) {
+  // Use terse output with SSID and SIGNAL fields separated by colon
+  char *output = exec_cmd("nmcli -t -f SSID,SIGNAL device wifi list");
+  if (!output) {
+    *count = 0;
+    return NULL;
+  }
+  int lines = 0;
+  for (char *p = output; *p; p++) {
+    if (*p == '\n')
+      lines++;
+  }
+  WifiEntry *networks = malloc(sizeof(WifiEntry) * lines);
+  if (!networks) {
+    free(output);
+    *count = 0;
+    return NULL;
+  }
+  int idx = 0;
+  char *line = strtok(output, "\n");
+  while (line && idx < lines) {
+    // Each line is expected to be in the format: SSID:SIGNAL
+    char *colon = strchr(line, ':');
+    if (colon) {
+      *colon = '\0';
+      strncpy(networks[idx].ssid, line, sizeof(networks[idx].ssid) - 1);
+      networks[idx].ssid[sizeof(networks[idx].ssid) - 1] = '\0';
+      networks[idx].signal = atoi(colon + 1);
+      idx++;
+    }
+    line = strtok(NULL, "\n");
+  }
+  *count = idx;
+  free(output);
+  return networks;
+}
+
+// Automatically switch to the best saved Wi-Fi (highest signal)
+// Returns 0 on success, nonzero on failure.
+int auto_switch_wifi(const char *nmcli_path) {
+  int savedCount = 0, availCount = 0;
+  char **saved = get_saved_connections(nmcli_path, &savedCount);
+  if (savedCount == 0) {
+    fprintf(stderr, "No saved Wi-Fi connections found.\n");
+    return 1;
+  }
+  WifiEntry *avail = get_available_networks(nmcli_path, &availCount);
+  if (availCount == 0) {
+    fprintf(stderr, "No available Wi-Fi networks detected.\n");
+    for (int i = 0; i < savedCount; i++)
+      free(saved[i]);
+    free(saved);
+    return 1;
+  }
+  // Find intersection: candidate SSIDs that are saved and available.
+  int bestSignal = -1;
+  char bestSSID[128] = "";
+  for (int i = 0; i < availCount; i++) {
+    if (strlen(avail[i].ssid) == 0)
+      continue; // skip empty SSIDs
+    for (int j = 0; j < savedCount; j++) {
+      // Compare saved connection name with available SSID (case-sensitive)
+      if (strcmp(avail[i].ssid, saved[j]) == 0) {
+        if (avail[i].signal > bestSignal) {
+          bestSignal = avail[i].signal;
+          strncpy(bestSSID, avail[i].ssid, sizeof(bestSSID) - 1);
+          bestSSID[sizeof(bestSSID) - 1] = '\0';
+        }
+        break;
+      }
+    }
+  }
+  // Free allocated lists.
+  for (int i = 0; i < savedCount; i++)
+    free(saved[i]);
+  free(saved);
+  free(avail);
+
+  if (bestSignal == -1) {
+    fprintf(stderr, "No known Wi-Fi networks are currently in range.\n");
+    return 1;
+  }
+  printf("Best candidate found: \"%s\" with signal strength %d\n", bestSSID,
+         bestSignal);
   char cmd[256];
-  snprintf(cmd, sizeof(cmd), "sudo %s con up \"%s\"", nmcli_path, chosen);
-  printf("Attempting to connect to \"%s\"...\n", chosen);
+  snprintf(cmd, sizeof(cmd), "sudo %s con up \"%s\"", nmcli_path, bestSSID);
+  printf("Attempting to connect to \"%s\"...\n", bestSSID);
   if (system(cmd) != 0) {
-    fprintf(stderr, "Failed to activate connection for \"%s\".\n", chosen);
-    exit(1);
+    fprintf(stderr, "Failed to activate connection for \"%s\".\n", bestSSID);
+    return 1;
   }
+  sleep(2);
   if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
-    fprintf(stderr,
-            "Reconnection attempt did not restore internet connectivity.\n");
-    exit(1);
+    fprintf(
+        stderr,
+        "Connection attempt to \"%s\" did not restore internet connectivity.\n",
+        bestSSID);
+    return 1;
   } else {
-    printf("Reconnected to \"%s\" successfully!\n", chosen);
+    printf("Reconnected to \"%s\" successfully!\n", bestSSID);
   }
+  return 0;
 }
 
 // Cleanup function to be called on SIGINT/SIGTERM.
-void cleanup(int sig) {
+void cleanup_handler(int sig) {
   printf("\nStopping hotspot...\n");
   if (hostapd_pid > 0) {
     kill(hostapd_pid, SIGTERM);
@@ -135,8 +227,8 @@ void cleanup(int sig) {
 }
 
 int main(void) {
-  signal(SIGINT, cleanup);
-  signal(SIGTERM, cleanup);
+  signal(SIGINT, cleanup_handler);
+  signal(SIGTERM, cleanup_handler);
 
   // Increase file descriptor limit.
   struct rlimit rl;
@@ -293,8 +385,11 @@ int main(void) {
   // Initial internet connectivity check.
   printf("Checking internet connectivity...\n");
   if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
-    // If lost here, try to reconnect immediately.
-    check_and_reconnect(nmcli_path);
+    // If lost here, attempt automatic reconnection.
+    if (auto_switch_wifi(nmcli_path) != 0) {
+      fprintf(stderr, "Initial reconnection failed.\n");
+      exit(1);
+    }
   }
   free(connection);
 
@@ -364,11 +459,20 @@ int main(void) {
   snprintf(dnsCmd, sizeof(dnsCmd), "sudo %s --interface=%s --dhcp-range=%s &",
            dnsmasq_path, AP_IFACE, DHCP_RANGE);
   system(dnsCmd);
-  if (!check_dnsmasq_running(dnsmasq_path)) {
+
+  // Wait a bit for dnsmasq to start (retry up to 3 times)
+  int retry = 3;
+  while (retry-- > 0) {
+    sleep(2);
+    if (check_dnsmasq_running(dnsmasq_path)) {
+      printf("dnsmasq is running and DHCP is enabled.\n");
+      break;
+    }
+    printf("Waiting for dnsmasq to start...\n");
+  }
+  if (retry < 0) {
     fprintf(stderr, "dnsmasq is not running. DHCP will not work.\n");
     exit(1);
-  } else {
-    printf("dnsmasq is running and DHCP is enabled.\n");
   }
 
   // Enable NAT for internet sharing.
@@ -395,8 +499,12 @@ int main(void) {
 
   // Main loop: continuously check internet connectivity every 10 seconds.
   while (1) {
+    sleep(10);
     if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
-      check_and_reconnect(nmcli_path);
+      printf("Internet connectivity lost. Attempting automatic switch...\n");
+      if (auto_switch_wifi(nmcli_path) != 0) {
+        fprintf(stderr, "Automatic switching failed. Retrying...\n");
+      }
     } else {
       printf("Internet connection stable.\n");
     }
