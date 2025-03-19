@@ -1,9 +1,10 @@
 #!/bin/bash
-# setup.sh – Script to install dependencies and compile the hotspot program
+# setup.sh – Setup script to install dependencies, stop conflicts, clean up interfaces,
+# and compile the hotspot program from source file "my.c" to output binary "myc".
 
 set -e
 
-# Function to install packages using the available package manager.
+# Function to install packages using available package manager.
 install_packages() {
     packages="$@"
     if command -v apt-get >/dev/null 2>&1; then
@@ -17,25 +18,25 @@ install_packages() {
         echo "Using pacman to install: $packages"
         sudo pacman -Sy --noconfirm $packages
     else
-        echo "No supported package manager found (apt-get, dnf, pacman). Please install the following packages manually: $packages"
+        echo "No supported package manager found. Please install the following packages manually: $packages"
         exit 1
     fi
 }
 
-# List of required commands and their corresponding package names.
+# List of required commands and corresponding package names.
 declare -A REQUIRED_CMDS
 REQUIRED_CMDS=(
   [iw]="iw"
   [hostapd]="hostapd"
   [dnsmasq]="dnsmasq"
   [nmcli]="network-manager"
-  [systemctl]="systemd"   # systemctl is typically part of systemd
+  [systemctl]="systemd"   # Typically part of systemd
   [ip]="iproute2"
   [iptables]="iptables"
   [gcc]="gcc"
 )
 
-# Determine which packages are missing.
+# Check for missing commands.
 MISSING_PACKAGES=()
 for cmd in "${!REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -49,7 +50,27 @@ if [ ${#MISSING_PACKAGES[@]} -gt 0 ]; then
     install_packages "${MISSING_PACKAGES[@]}"
 fi
 
-# Compile the C program.
+# Stop systemd-resolved to avoid conflict with dnsmasq on port 53.
+if systemctl is-active --quiet systemd-resolved; then
+    echo "Stopping and disabling systemd-resolved (it may conflict with dnsmasq)..."
+    sudo systemctl stop systemd-resolved
+    sudo systemctl disable systemd-resolved
+fi
+
+# Clean up any leftover AP interface (ap0).
+if ip link show ap0 >/dev/null 2>&1; then
+    echo "Interface ap0 already exists. Deleting it..."
+    sudo ip link delete ap0
+fi
+
+# Optionally verify that the wireless device supports AP mode.
+echo "Verifying wireless device supports AP mode..."
+if ! iw list | grep -q "AP"; then
+    echo "Warning: Your wireless device may not support AP mode."
+    echo "Please check 'iw list' to confirm supported interface modes."
+fi
+
+# Compile the C program from my.c to output myc.
 if [ ! -f my.c ]; then
     echo "Source file my.c not found in the current directory."
     exit 1
@@ -57,7 +78,17 @@ fi
 
 echo "Compiling my.c..."
 gcc -o myc my.c
-
 echo "Compilation successful."
-echo "You can now run the program (it requires root privileges):"
-echo "  sudo ./myc"
+
+cat <<EOF
+
+Setup complete.
+You can now run the hotspot program (it requires root privileges):
+  sudo ./myc
+
+This program will:
+ - Start NetworkManager and create a hotspot with the provided SSID and password.
+ - Continuously monitor internet connectivity using ping.
+ - Automatically switch to the best available saved Wi-Fi network if connectivity is lost.
+
+EOF
