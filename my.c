@@ -10,6 +10,7 @@
 #define HOSTAPD_CONF "/tmp/hostapd.conf"
 #define AP_IP "192.168.4.1/24"
 #define DHCP_RANGE "192.168.4.2,192.168.4.100,12h"
+#define CONFIG_FILE "/tmp/hotspot.conf" // file to persist SSID and password
 
 pid_t hostapd_pid = -1;
 
@@ -204,7 +205,7 @@ int auto_switch_wifi(const char *nmcli_path) {
     return 1;
   }
   sleep(2);
-  if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
+  if (system("ping -c 2 google.com >/dev/null 2>&1") != 0) {
     fprintf(
         stderr,
         "Connection attempt to \"%s\" did not restore internet connectivity.\n",
@@ -221,6 +222,45 @@ void check_systemd_resolved() {
   if (system("systemctl is-active --quiet systemd-resolved") == 0) {
     fprintf(stderr, "Warning: systemd-resolved is active. It may conflict with "
                     "dnsmasq on port 53.\n");
+  }
+}
+
+// Function to load hotspot configuration (SSID and password) from file,
+// or prompt the user if not present.
+void load_hotspot_config(char *ssid, size_t ssid_len, char *pass,
+                         size_t pass_len) {
+  FILE *config = fopen(CONFIG_FILE, "r");
+  if (config) {
+    if (fgets(ssid, ssid_len, config) != NULL) {
+      ssid[strcspn(ssid, "\n")] = '\0';
+    }
+    if (fgets(pass, pass_len, config) != NULL) {
+      pass[strcspn(pass, "\n")] = '\0';
+    }
+    fclose(config);
+    printf("Using saved hotspot configuration:\n  SSID: %s\n", ssid);
+  } else {
+    printf("Enter SSID for hotspot: ");
+    if (!fgets(ssid, ssid_len, stdin)) {
+      fprintf(stderr, "Error reading SSID\n");
+      exit(1);
+    }
+    ssid[strcspn(ssid, "\n")] = '\0';
+
+    printf("Enter Password for hotspot: ");
+    if (!fgets(pass, pass_len, stdin)) {
+      fprintf(stderr, "Error reading Password\n");
+      exit(1);
+    }
+    pass[strcspn(pass, "\n")] = '\0';
+    printf("\n");
+    config = fopen(CONFIG_FILE, "w");
+    if (!config) {
+      perror("fopen config file for writing");
+      exit(1);
+    }
+    fprintf(config, "%s\n%s\n", ssid, pass);
+    fclose(config);
   }
 }
 
@@ -284,22 +324,22 @@ int main(void) {
   wlan_iface[strcspn(wlan_iface, "\n")] = '\0';
   printf("Detected connected WLAN interface: %s\n", wlan_iface);
 
-  // Prompt user for hotspot SSID and Password.
+  // Load hotspot configuration (SSID and password) from file or prompt.
   char ssid[128], pass[128];
-  printf("Enter SSID for hotspot: ");
-  if (!fgets(ssid, sizeof(ssid), stdin)) {
-    fprintf(stderr, "Error reading SSID\n");
-    exit(1);
-  }
-  ssid[strcspn(ssid, "\n")] = '\0';
+  load_hotspot_config(ssid, sizeof(ssid), pass, sizeof(pass));
 
-  printf("Enter Password for hotspot: ");
-  if (!fgets(pass, sizeof(pass), stdin)) {
-    fprintf(stderr, "Error reading Password\n");
-    exit(1);
+  // Prompt for connectivity check interval.
+  int check_interval = 10; // default seconds
+  char interval_input[16];
+  printf("Enter connectivity check interval in seconds [default 10]: ");
+  if (fgets(interval_input, sizeof(interval_input), stdin) != NULL) {
+    if (interval_input[0] != '\n') {
+      check_interval = atoi(interval_input);
+      if (check_interval <= 0)
+        check_interval = 10;
+    }
   }
-  pass[strcspn(pass, "\n")] = '\0';
-  printf("\n");
+  printf("Using connectivity check interval: %d seconds\n", check_interval);
 
   // Start NetworkManager.
   char nmcli_start[256];
@@ -397,7 +437,7 @@ int main(void) {
 
   // Initial internet connectivity check.
   printf("Checking internet connectivity...\n");
-  if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
+  if (system("ping -c 2 google.com >/dev/null 2>&1") != 0) {
     if (auto_switch_wifi(nmcli_path) != 0) {
       fprintf(stderr, "Initial reconnection failed.\n");
       exit(1);
@@ -465,8 +505,7 @@ int main(void) {
     exit(1);
   }
 
-  // Start dnsmasq for DHCP.
-  // Bind dnsmasq only to the hotspot's IP to avoid conflicts.
+  // Start dnsmasq for DHCP, binding only to the hotspot's IP.
   char dnsCmd[256];
   snprintf(dnsCmd, sizeof(dnsCmd),
            "sudo %s --interface=%s --bind-interfaces "
@@ -511,8 +550,8 @@ int main(void) {
   printf("Press Ctrl+C to stop.\n");
 
   while (1) {
-    sleep(10);
-    if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
+    sleep(check_interval);
+    if (system("ping -c 2 google.com >/dev/null 2>&1") != 0) {
       printf("Internet connectivity lost. Attempting automatic switch...\n");
       if (auto_switch_wifi(nmcli_path) != 0) {
         fprintf(stderr, "Automatic switching failed. Retrying...\n");
