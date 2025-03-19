@@ -1,6 +1,7 @@
 #!/bin/bash
 # setup.sh – Setup script to install dependencies, stop conflicts, clean up interfaces,
-# and compile the hotspot program from source file "my.c" to output binary "myc".
+# disable Wi-Fi power saving, and compile the hotspot program from source file "my.c"
+# to output binary "myc".
 
 set -e
 
@@ -57,10 +58,21 @@ if systemctl is-active --quiet systemd-resolved; then
     sudo systemctl disable systemd-resolved
 fi
 
-# Kill any process using port 53 (both UDP and TCP) to free it for dnsmasq.
-echo "Ensuring port 53 is free..."
+# Ensure port 53 is free (both TCP and UDP).
+echo "Freeing port 53..."
 sudo fuser -k 53/tcp 2>/dev/null || true
 sudo fuser -k 53/udp 2>/dev/null || true
+
+# Disable Wi-Fi power saving to avoid disconnections.
+echo "Disabling Wi-Fi power saving..."
+CONF_FILE="/etc/NetworkManager/conf.d/default-wifi-powersave-on.conf"
+sudo mkdir -p "$(dirname $CONF_FILE)"
+sudo tee "$CONF_FILE" >/dev/null <<EOF
+[connection]
+wifi.powersave = 2
+EOF
+# Restart NetworkManager to apply changes.
+sudo systemctl restart NetworkManager
 
 # Clean up any leftover AP interface (ap0).
 if ip link show ap0 >/dev/null 2>&1; then
@@ -75,7 +87,7 @@ if ! iw list | grep -q "AP"; then
     echo "Please check 'iw list' to confirm supported interface modes."
 fi
 
-# Compile the C program from my.c to output myc.
+# Compile the C program from my.c to output binary myc.
 if [ ! -f my.c ]; then
     echo "Source file my.c not found in the current directory."
     exit 1
