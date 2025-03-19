@@ -72,13 +72,11 @@ int check_ap_ip(const char *ip_path) {
 
 // Retrieve saved Wi-Fi connection names (assumed to match SSIDs)
 char **get_saved_connections(const char *nmcli_path, int *count) {
-  // Use terse nmcli output to list connection names
   char *saved = exec_cmd("nmcli -t -f NAME connection show");
   if (!saved) {
     *count = 0;
     return NULL;
   }
-  // Count lines
   int lines = 0;
   for (char *p = saved; *p; p++) {
     if (*p == '\n')
@@ -110,7 +108,6 @@ typedef struct {
 } WifiEntry;
 
 WifiEntry *get_available_networks(const char *nmcli_path, int *count) {
-  // Use terse output with SSID and SIGNAL fields separated by colon
   char *output = exec_cmd("nmcli -t -f SSID,SIGNAL device wifi list");
   if (!output) {
     *count = 0;
@@ -130,7 +127,6 @@ WifiEntry *get_available_networks(const char *nmcli_path, int *count) {
   int idx = 0;
   char *line = strtok(output, "\n");
   while (line && idx < lines) {
-    // Each line is expected to be in the format: SSID:SIGNAL
     char *colon = strchr(line, ':');
     if (colon) {
       *colon = '\0';
@@ -163,14 +159,12 @@ int auto_switch_wifi(const char *nmcli_path) {
     free(saved);
     return 1;
   }
-  // Find intersection: candidate SSIDs that are saved and available.
   int bestSignal = -1;
   char bestSSID[128] = "";
   for (int i = 0; i < availCount; i++) {
     if (strlen(avail[i].ssid) == 0)
-      continue; // skip empty SSIDs
+      continue;
     for (int j = 0; j < savedCount; j++) {
-      // Compare saved connection name with available SSID (case-sensitive)
       if (strcmp(avail[i].ssid, saved[j]) == 0) {
         if (avail[i].signal > bestSignal) {
           bestSignal = avail[i].signal;
@@ -181,7 +175,6 @@ int auto_switch_wifi(const char *nmcli_path) {
       }
     }
   }
-  // Free allocated lists.
   for (int i = 0; i < savedCount; i++)
     free(saved[i]);
   free(saved);
@@ -213,6 +206,14 @@ int auto_switch_wifi(const char *nmcli_path) {
   return 0;
 }
 
+// Check if systemd-resolved is active and warn the user.
+void check_systemd_resolved() {
+  if (system("systemctl is-active --quiet systemd-resolved") == 0) {
+    fprintf(stderr, "Warning: systemd-resolved is active. It may conflict with "
+                    "dnsmasq on port 53.\n");
+  }
+}
+
 // Cleanup function to be called on SIGINT/SIGTERM.
 void cleanup_handler(int sig) {
   printf("\nStopping hotspot...\n");
@@ -237,7 +238,7 @@ int main(void) {
     setrlimit(RLIMIT_NOFILE, &rl);
   }
 
-  // Fetch full paths for all required commands.
+  // Fetch full paths for required commands.
   char *iw_path = get_cmd_path("iw");
   char *hostapd_path = get_cmd_path("hostapd");
   char *dnsmasq_path = get_cmd_path("dnsmasq");
@@ -261,7 +262,10 @@ int main(void) {
   printf("ip:         %s\n", ip_path);
   printf("iptables:   %s\n", iptables_path);
 
-  // Automatically fetch the connected WLAN interface using nmcli.
+  // Check if systemd-resolved is active.
+  check_systemd_resolved();
+
+  // Fetch the connected WLAN interface using nmcli.
   char *wlan_iface = exec_cmd("nmcli -t -f DEVICE,TYPE,STATE dev status | grep "
                               "':wifi:connected' | cut -d: -f1 | head -n1");
   if (!wlan_iface || strlen(wlan_iface) == 0) {
@@ -271,7 +275,7 @@ int main(void) {
   wlan_iface[strcspn(wlan_iface, "\n")] = '\0';
   printf("Detected connected WLAN interface: %s\n", wlan_iface);
 
-  // Prompt user for SSID and Password for the hotspot.
+  // Prompt user for hotspot SSID and Password.
   char ssid[128], pass[128];
   printf("Enter SSID for hotspot: ");
   if (!fgets(ssid, sizeof(ssid), stdin)) {
@@ -385,7 +389,6 @@ int main(void) {
   // Initial internet connectivity check.
   printf("Checking internet connectivity...\n");
   if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
-    // If lost here, attempt automatic reconnection.
     if (auto_switch_wifi(nmcli_path) != 0) {
       fprintf(stderr, "Initial reconnection failed.\n");
       exit(1);
@@ -447,7 +450,6 @@ int main(void) {
            AP_IFACE);
   system(linkCmd);
 
-  // Check that the AP interface has the correct IP.
   if (!check_ap_ip(ip_path)) {
     fprintf(stderr, "AP interface %s did not receive the correct IP address.\n",
             AP_IFACE);
@@ -455,12 +457,14 @@ int main(void) {
   }
 
   // Start dnsmasq for DHCP.
+  // Modify dnsmasq command to bind only to the hotspot IP:
   char dnsCmd[256];
-  snprintf(dnsCmd, sizeof(dnsCmd), "sudo %s --interface=%s --dhcp-range=%s &",
+  snprintf(dnsCmd, sizeof(dnsCmd),
+           "sudo %s --interface=%s --bind-interfaces "
+           "--listen-address=192.168.4.1 --dhcp-range=%s &",
            dnsmasq_path, AP_IFACE, DHCP_RANGE);
   system(dnsCmd);
 
-  // Wait a bit for dnsmasq to start (retry up to 3 times)
   int retry = 3;
   while (retry-- > 0) {
     sleep(2);
@@ -497,7 +501,6 @@ int main(void) {
   printf("Clients should obtain an IP address from dnsmasq.\n");
   printf("Press Ctrl+C to stop.\n");
 
-  // Main loop: continuously check internet connectivity every 10 seconds.
   while (1) {
     sleep(10);
     if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
@@ -510,7 +513,6 @@ int main(void) {
     }
   }
 
-  // Cleanup (not reached).
   free(iw_path);
   free(hostapd_path);
   free(dnsmasq_path);
