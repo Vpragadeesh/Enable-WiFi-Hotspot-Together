@@ -109,3 +109,6 @@ This program will:
  - Automatically switch to the best available saved Wi-Fi network if connectivity is lost.
 
 EOF
+sudo systemctl enable systemd-resolved
+sudo systemctl start systemd-resolved
+sudo systemctl restart NetworkManager
