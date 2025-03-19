@@ -113,6 +113,15 @@ WifiEntry *get_available_networks(const char *nmcli_path, int *count) {
     *count = 0;
     return NULL;
   }
+  if (strlen(output) == 0) {
+    fprintf(
+        stderr,
+        "Warning: 'nmcli device wifi list' returned empty. "
+        "Your device/driver may not support scanning in AP mode on this OS.\n");
+    *count = 0;
+    free(output);
+    return NULL;
+  }
   int lines = 0;
   for (char *p = output; *p; p++) {
     if (*p == '\n')
@@ -153,7 +162,8 @@ int auto_switch_wifi(const char *nmcli_path) {
   }
   WifiEntry *avail = get_available_networks(nmcli_path, &availCount);
   if (availCount == 0) {
-    fprintf(stderr, "No available Wi-Fi networks detected.\n");
+    fprintf(stderr, "No available Wi-Fi networks detected. Auto-switching is "
+                    "not supported on this system.\n");
     for (int i = 0; i < savedCount; i++)
       free(saved[i]);
     free(saved);
@@ -262,7 +272,6 @@ int main(void) {
   printf("ip:         %s\n", ip_path);
   printf("iptables:   %s\n", iptables_path);
 
-  // Check if systemd-resolved is active.
   check_systemd_resolved();
 
   // Fetch the connected WLAN interface using nmcli.
@@ -457,7 +466,7 @@ int main(void) {
   }
 
   // Start dnsmasq for DHCP.
-  // Modify dnsmasq command to bind only to the hotspot IP:
+  // Bind dnsmasq only to the hotspot's IP to avoid conflicts.
   char dnsCmd[256];
   snprintf(dnsCmd, sizeof(dnsCmd),
            "sudo %s --interface=%s --bind-interfaces "
