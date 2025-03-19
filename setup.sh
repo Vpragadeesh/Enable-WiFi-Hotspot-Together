@@ -57,6 +57,11 @@ if systemctl is-active --quiet systemd-resolved; then
     sudo systemctl disable systemd-resolved
 fi
 
+# Kill any process using port 53 (both UDP and TCP) to free it for dnsmasq.
+echo "Ensuring port 53 is free..."
+sudo fuser -k 53/tcp 2>/dev/null || true
+sudo fuser -k 53/udp 2>/dev/null || true
+
 # Clean up any leftover AP interface (ap0).
 if ip link show ap0 >/dev/null 2>&1; then
     echo "Interface ap0 already exists. Deleting it..."
