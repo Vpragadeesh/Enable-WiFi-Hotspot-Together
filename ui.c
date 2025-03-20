@@ -244,7 +244,6 @@ void cleanup_handler(int sig) {
 }
 
 // --- Hotspot Process Function ---
-// This function contains your original hotspot setup/monitoring logic.
 void run_hotspot() {
     signal(SIGINT, cleanup_handler);
     signal(SIGTERM, cleanup_handler);
@@ -544,16 +543,20 @@ void configure_hotspot_tui() {
         mvprintw(10, 2, "Error updating configuration!");
     }
     mvprintw(12, 2, "Press any key to return to menu...");
+    refresh();
     getch();
 }
 
 // Start the hotspot process.
 void start_hotspot_tui() {
     if (hotspot_pid > 0) {
+        clear();
+        box(stdscr, 0, 0);
         attron(COLOR_PAIR(2));
         mvprintw(2, 2, "Hotspot is already running (PID: %d).", hotspot_pid);
         attroff(COLOR_PAIR(2));
         mvprintw(4, 2, "Press any key to return to menu...");
+        refresh();
         getch();
         return;
     }
@@ -565,13 +568,17 @@ void start_hotspot_tui() {
         run_hotspot();
         exit(0);
     } else if (hotspot_pid < 0) {
+        clear();
         mvprintw(2, 2, "Failed to start hotspot.");
+        refresh();
         getch();
     } else {
+        clear();
         attron(COLOR_PAIR(2));
         mvprintw(2, 2, "Hotspot started successfully (PID: %d).", hotspot_pid);
         attroff(COLOR_PAIR(2));
         mvprintw(4, 2, "Press any key to return to menu...");
+        refresh();
         getch();
     }
 }
@@ -579,16 +586,22 @@ void start_hotspot_tui() {
 // Stop the hotspot process.
 void stop_hotspot_tui() {
     if (hotspot_pid <= 0) {
+        clear();
+        box(stdscr, 0, 0);
         mvprintw(2, 2, "Hotspot is not running.");
         mvprintw(4, 2, "Press any key to return to menu...");
+        refresh();
         getch();
         return;
     }
     kill(hotspot_pid, SIGTERM);
     waitpid(hotspot_pid, NULL, 0);
+    clear();
+    box(stdscr, 0, 0);
     mvprintw(2, 2, "Hotspot stopped successfully.");
     hotspot_pid = -1;
     mvprintw(4, 2, "Press any key to return to menu...");
+    refresh();
     getch();
 }
 
@@ -674,7 +687,6 @@ int main() {
                 } else if (choice == 2) {  // Configure Hotspot
                     configure_hotspot_tui();
                 } else if (choice == 3) {  // Exit
-                    // Confirm exit if hotspot is running.
                     if (hotspot_pid > 0) {
                         clear();
                         box(stdscr, 0, 0);
@@ -702,4 +714,3 @@ int main() {
     endwin();
     return 0;
 }
-
