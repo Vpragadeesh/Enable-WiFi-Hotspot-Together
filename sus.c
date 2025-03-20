@@ -1,4 +1,4 @@
-#include <ncurses.h>
+#include <newt.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,6 +6,13 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <errno.h>
+
+//----------------------
+// Global Variables & Constants
+//----------------------
+pid_t hotspot_pid = -1;  // Process ID for the hotspot daemon
+pid_t hostapd_pid = -1;  // Process ID for hostapd (used in the daemon)
 
 #define AP_IFACE "ap0"
 #define HOSTAPD_CONF "/tmp/hostapd.conf"
@@ -13,13 +20,27 @@
 #define DHCP_RANGE "192.168.4.2,192.168.4.100,12h"
 #define CONFIG_FILE "/tmp/hotspot.conf" // File to persist SSID and password
 
-// Global process IDs.
-pid_t hostapd_pid = -1;   // For hostapd process
-pid_t hotspot_pid = -1;   // For the overall hotspot process
+//----------------------
+// Cleanup Handler
+//----------------------
+// This function is called on SIGINT/SIGTERM to clean up the hotspot.
+void cleanup_handler(int sig) {
+    printf("\nStopping hotspot...\n");
+    if (hostapd_pid > 0) {
+        kill(hostapd_pid, SIGTERM);
+    }
+    system("sudo killall dnsmasq 2>/dev/null");
+    char delCmd[128];
+    snprintf(delCmd, sizeof(delCmd), "sudo iw dev %s del", AP_IFACE);
+    system(delCmd);
+    exit(0);
+}
 
-// --- Helper Functions ---
+//----------------------
+// Helper Functions (from hotspot code)
+//----------------------
 
-// Execute a command and capture its output.
+// Execute a command and capture its output in a malloc'ed string.
 char *exec_cmd(const char *cmd) {
     FILE *fp;
     char *result = NULL;
@@ -52,17 +73,19 @@ char *get_cmd_path(const char *cmd) {
     snprintf(buf, sizeof(buf), "command -v %s", cmd);
     char *path = exec_cmd(buf);
     if (path) {
-        path[strcspn(path, "\n")] = '\0';
+        path[strcspn(path, "\n")] = '\0'; // Remove newline
     }
     return path;
 }
 
+// Check if dnsmasq is running.
 int check_dnsmasq_running(const char *dnsmasq_path) {
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "pgrep -x %s >/dev/null 2>&1", "dnsmasq");
     return (system(cmd) == 0);
 }
 
+// Check that the AP interface has the expected IP.
 int check_ap_ip(const char *ip_path) {
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "%s addr show %s", ip_path, AP_IFACE);
@@ -74,6 +97,13 @@ int check_ap_ip(const char *ip_path) {
     return ok;
 }
 
+// Structures and functions for Wi-Fi network scanning.
+typedef struct {
+    char ssid[128];
+    int signal;
+} WifiEntry;
+
+// Retrieve saved Wi-Fi connections (SSIDs).
 char **get_saved_connections(const char *nmcli_path, int *count) {
     char *saved = exec_cmd("nmcli -t -f NAME connection show");
     if (!saved) {
@@ -103,11 +133,7 @@ char **get_saved_connections(const char *nmcli_path, int *count) {
     return list;
 }
 
-typedef struct {
-    char ssid[128];
-    int signal;
-} WifiEntry;
-
+// Retrieve available Wi-Fi networks.
 WifiEntry *get_available_networks(const char *nmcli_path, int *count) {
     char *output = exec_cmd("nmcli -t -f SSID,SIGNAL device wifi list");
     if (!output) {
@@ -124,7 +150,7 @@ WifiEntry *get_available_networks(const char *nmcli_path, int *count) {
     }
     int lines = 0;
     for (char *p = output; *p; p++) {
-        if (*p == '\n')
+       if (*p == '\n')
             lines++;
     }
     WifiEntry *networks = malloc(sizeof(WifiEntry) * lines);
@@ -151,6 +177,7 @@ WifiEntry *get_available_networks(const char *nmcli_path, int *count) {
     return networks;
 }
 
+// Automatically switch to the best saved Wi-Fi (highest signal).
 int auto_switch_wifi(const char *nmcli_path) {
     int savedCount = 0, availCount = 0;
     char **saved = get_saved_connections(nmcli_path, &savedCount);
@@ -209,52 +236,67 @@ int auto_switch_wifi(const char *nmcli_path) {
     return 0;
 }
 
+// Warn if systemd-resolved is active.
 void check_systemd_resolved() {
     if (system("systemctl is-active --quiet systemd-resolved") == 0) {
         fprintf(stderr, "Warning: systemd-resolved is active. It may conflict with dnsmasq on port 53.\n");
     }
 }
 
-// Load hotspot configuration (SSID and password) from file.
+// Load hotspot configuration (SSID and password) from file or prompt.
 void load_hotspot_config(char *ssid, size_t ssid_len, char *pass, size_t pass_len) {
     FILE *config = fopen(CONFIG_FILE, "r");
     if (config) {
-        if (fgets(ssid, ssid_len, config) != NULL)
+        if (fgets(ssid, ssid_len, config) != NULL) {
             ssid[strcspn(ssid, "\n")] = '\0';
-        if (fgets(pass, pass_len, config) != NULL)
+        }
+        if (fgets(pass, pass_len, config) != NULL) {
             pass[strcspn(pass, "\n")] = '\0';
+        }
         fclose(config);
+        printf("Using saved hotspot configuration:\n  SSID: %s\n", ssid);
     } else {
-        strncpy(ssid, "MyHotspot", ssid_len);
-        strncpy(pass, "password123", pass_len);
+        printf("Enter SSID for hotspot: ");
+        if (!fgets(ssid, ssid_len, stdin)) {
+            fprintf(stderr, "Error reading SSID\n");
+            exit(1);
+        }
+        ssid[strcspn(ssid, "\n")] = '\0';
+
+        printf("Enter Password for hotspot: ");
+        if (!fgets(pass, pass_len, stdin)) {
+            fprintf(stderr, "Error reading Password\n");
+            exit(1);
+        }
+        pass[strcspn(pass, "\n")] = '\0';
+        printf("\n");
+        config = fopen(CONFIG_FILE, "w");
+        if (!config) {
+            perror("fopen config file for writing");
+            exit(1);
+        }
+        fprintf(config, "%s\n%s\n", ssid, pass);
+        fclose(config);
     }
 }
 
-// Cleanup function for the hotspot process.
-void cleanup_handler(int sig) {
-    printf("\nStopping hotspot...\n");
-    if (hostapd_pid > 0) {
-        kill(hostapd_pid, SIGTERM);
-    }
-    system("sudo killall dnsmasq 2>/dev/null");
-    char delCmd[128];
-    snprintf(delCmd, sizeof(delCmd), "sudo iw dev %s del", AP_IFACE);
-    system(delCmd);
-    exit(0);
-}
-
-// --- Hotspot Process Function ---
-// This function contains your original hotspot setup/monitoring logic.
-void run_hotspot() {
+//----------------------
+// Hotspot Daemon Function
+// This function implements the hotspot functionality and is run in a child process.
+//----------------------
+void hotspot_daemon_main(void) {
+    // Set up signal handlers for clean exit.
     signal(SIGINT, cleanup_handler);
     signal(SIGTERM, cleanup_handler);
 
+    // Increase file descriptor limit.
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
         rl.rlim_cur = 4096;
         setrlimit(RLIMIT_NOFILE, &rl);
     }
 
+    // Fetch full paths for required commands.
     char *iw_path = get_cmd_path("iw");
     char *hostapd_path = get_cmd_path("hostapd");
     char *dnsmasq_path = get_cmd_path("dnsmasq");
@@ -280,6 +322,7 @@ void run_hotspot() {
 
     check_systemd_resolved();
 
+    // Get the connected WLAN interface.
     char *wlan_iface = exec_cmd("nmcli -t -f DEVICE,TYPE,STATE dev status | grep ':wifi:connected' | cut -d: -f1 | head -n1");
     if (!wlan_iface || strlen(wlan_iface) == 0) {
         fprintf(stderr, "No connected WLAN interface detected.\n");
@@ -288,13 +331,24 @@ void run_hotspot() {
     wlan_iface[strcspn(wlan_iface, "\n")] = '\0';
     printf("Detected connected WLAN interface: %s\n", wlan_iface);
 
+    // Load hotspot configuration.
     char ssid[128], pass[128];
     load_hotspot_config(ssid, sizeof(ssid), pass, sizeof(pass));
-    printf("Using hotspot configuration: SSID=%s\n", ssid);
 
+    // Prompt for connectivity check interval.
     int check_interval = 10;
+    char interval_input[16];
+    printf("Enter connectivity check interval in seconds [default 10]: ");
+    if (fgets(interval_input, sizeof(interval_input), stdin) != NULL) {
+        if (interval_input[0] != '\n') {
+            check_interval = atoi(interval_input);
+            if (check_interval <= 0)
+                check_interval = 10;
+        }
+    }
     printf("Using connectivity check interval: %d seconds\n", check_interval);
 
+    // Start NetworkManager.
     char nmcli_start[256];
     snprintf(nmcli_start, sizeof(nmcli_start), "sudo %s start NetworkManager", systemctl_path);
     printf("Starting NetworkManager...\n");
@@ -304,10 +358,9 @@ void run_hotspot() {
         exit(1);
     }
 
+    // Verify primary wireless connection.
     char nmcliCmd[256];
-    snprintf(nmcliCmd, sizeof(nmcliCmd),
-             "%s -t -f NAME,DEVICE con show --active | grep \"%s\" | cut -d: -f1",
-             nmcli_path, wlan_iface);
+    snprintf(nmcliCmd, sizeof(nmcliCmd), "%s -t -f NAME,DEVICE con show --active | grep \"%s\" | cut -d: -f1", nmcli_path, wlan_iface);
     char *connection = exec_cmd(nmcliCmd);
     if (!connection || strlen(connection) == 0) {
         fprintf(stderr, "Error: %s not connected.\n", wlan_iface);
@@ -316,6 +369,7 @@ void run_hotspot() {
     }
     printf("Connected via: %s", connection);
 
+    // Extract channel and frequency info using iw.
     char iwCmd[256];
     snprintf(iwCmd, sizeof(iwCmd), "%s dev %s info", iw_path, wlan_iface);
     char *wlanInfo = exec_cmd(iwCmd);
@@ -358,6 +412,7 @@ void run_hotspot() {
     const char *hw_mode = "a";
     printf("Using hardware mode: %s\n", hw_mode);
 
+    // Remove any existing AP interface.
     char checkAP[128];
     snprintf(checkAP, sizeof(checkAP), "sudo %s dev %s info >/dev/null 2>&1", iw_path, AP_IFACE);
     if (system(checkAP) == 0) {
@@ -367,6 +422,7 @@ void run_hotspot() {
         system(delCmd);
     }
 
+    // Create the AP interface.
     char addIf[256];
     snprintf(addIf, sizeof(addIf), "sudo %s dev %s interface add %s type __ap", iw_path, wlan_iface, AP_IFACE);
     printf("Creating %s...\n", AP_IFACE);
@@ -378,6 +434,7 @@ void run_hotspot() {
     snprintf(nmcliSet, sizeof(nmcliSet), "sudo %s dev set %s managed no", nmcli_path, AP_IFACE);
     system(nmcliSet);
 
+    // Initial internet connectivity check.
     printf("Checking internet connectivity...\n");
     if (system("ping -c 2 google.com >/dev/null 2>&1") != 0) {
         if (auto_switch_wifi(nmcli_path) != 0) {
@@ -387,6 +444,7 @@ void run_hotspot() {
     }
     free(connection);
 
+    // Write hostapd configuration.
     printf("Configuring hostapd...\n");
     FILE *fp = fopen(HOSTAPD_CONF, "w");
     if (!fp) {
@@ -407,17 +465,16 @@ void run_hotspot() {
             AP_IFACE, ssid, hw_mode, channel, pass);
     fclose(fp);
 
+    // Stop any existing dnsmasq.
     if (system("pgrep dnsmasq >/dev/null 2>&1") == 0) {
         printf("Stopping existing dnsmasq...\n");
         system("sudo killall dnsmasq");
     }
 
+    // Start hostapd.
     printf("Starting hostapd...\n");
     hostapd_pid = fork();
     if (hostapd_pid == 0) {
-        // Redirect child's stdout and stderr to /dev/null to avoid interfering with the TUI.
-        freopen("/dev/null", "w", stdout);
-        freopen("/dev/null", "w", stderr);
         execlp("sudo", "sudo", hostapd_path, HOSTAPD_CONF, NULL);
         perror("execlp hostapd failed");
         exit(1);
@@ -431,6 +488,7 @@ void run_hotspot() {
         exit(1);
     }
 
+    // Set up IP and bring up the AP interface.
     char ipCmd[128];
     snprintf(ipCmd, sizeof(ipCmd), "sudo %s addr add %s dev %s", ip_path, AP_IP, AP_IFACE);
     system(ipCmd);
@@ -443,6 +501,7 @@ void run_hotspot() {
         exit(1);
     }
 
+    // Start dnsmasq for DHCP.
     char dnsCmd[256];
     snprintf(dnsCmd, sizeof(dnsCmd),
              "sudo %s --interface=%s --bind-interfaces --listen-address=192.168.4.1 --dhcp-range=%s &",
@@ -463,14 +522,14 @@ void run_hotspot() {
         exit(1);
     }
 
+    // Enable NAT for internet sharing.
     printf("Enabling NAT...\n");
     system("sudo sysctl -w net.ipv4.ip_forward=1");
     char iptCmd[256];
     snprintf(iptCmd, sizeof(iptCmd),
              "sudo %s -t nat -A POSTROUTING -o %s -j MASQUERADE", iptables_path, wlan_iface);
     system(iptCmd);
-    snprintf(iptCmd, sizeof(iptCmd), "sudo %s -A FORWARD -i %s -o %s -j ACCEPT",
-             iptables_path, AP_IFACE, wlan_iface);
+    snprintf(iptCmd, sizeof(iptCmd), "sudo %s -A FORWARD -i %s -o %s -j ACCEPT", iptables_path, AP_IFACE, wlan_iface);
     system(iptCmd);
     snprintf(iptCmd, sizeof(iptCmd),
              "sudo %s -A FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT",
@@ -479,8 +538,9 @@ void run_hotspot() {
 
     printf("Hotspot started on channel %s using interface %s.\n", channel, AP_IFACE);
     printf("Clients should obtain an IP address from dnsmasq.\n");
-    printf("Press Ctrl+C to stop hotspot.\n");
+    printf("Press Ctrl+C to stop.\n");
 
+    // Loop to periodically check connectivity and auto-switch if needed.
     while (1) {
         sleep(check_interval);
         if (system("ping -c 2 google.com >/dev/null 2>&1") != 0) {
@@ -493,6 +553,7 @@ void run_hotspot() {
         }
     }
 
+    // Cleanup: free allocated paths.
     free(iw_path);
     free(hostapd_path);
     free(dnsmasq_path);
@@ -501,205 +562,89 @@ void run_hotspot() {
     free(ip_path);
     free(iptables_path);
     free(wlan_iface);
-    exit(0);
 }
 
-// --- TUI Functions ---
+//----------------------
+// TUI Functions
+//----------------------
 
-// Display and update hotspot configuration.
-void configure_hotspot_tui() {
-    char ssid[128], pass[128];
-    load_hotspot_config(ssid, sizeof(ssid), pass, sizeof(pass));
-
-    clear();
-    box(stdscr, 0, 0);
-    mvprintw(1, 2, "=== Configure Hotspot ===");
-    mvprintw(3, 2, "Current SSID: %s", ssid);
-    mvprintw(4, 2, "Current Password: %s", pass);
-
-    mvprintw(6, 2, "Enter new SSID (leave blank to keep current): ");
-    echo();
-    char new_ssid[128];
-    getnstr(new_ssid, sizeof(new_ssid) - 1);
-    noecho();
-    if (strlen(new_ssid) > 0) {
-        strncpy(ssid, new_ssid, sizeof(ssid) - 1);
-    }
-
-    mvprintw(8, 2, "Enter new Password (leave blank to keep current): ");
-    echo();
-    char new_pass[128];
-    getnstr(new_pass, sizeof(new_pass) - 1);
-    noecho();
-    if (strlen(new_pass) > 0) {
-        strncpy(pass, new_pass, sizeof(pass) - 1);
-    }
-
-    FILE *config = fopen(CONFIG_FILE, "w");
-    if (config) {
-        fprintf(config, "%s\n%s\n", ssid, pass);
-        fclose(config);
-        mvprintw(10, 2, "Hotspot configuration updated!");
-    } else {
-        mvprintw(10, 2, "Error updating configuration!");
-    }
-    mvprintw(12, 2, "Press any key to return to menu...");
-    getch();
-}
-
-// Start the hotspot process.
-void start_hotspot_tui() {
+// Start the hotspot daemon in a separate process.
+void start_hotspot() {
     if (hotspot_pid > 0) {
-        attron(COLOR_PAIR(2));
-        mvprintw(2, 2, "Hotspot is already running (PID: %d).", hotspot_pid);
-        attroff(COLOR_PAIR(2));
-        mvprintw(4, 2, "Press any key to return to menu...");
-        getch();
+        newtWinMessage("Hotspot", "Already Running", "Hotspot is already running.");
         return;
     }
     hotspot_pid = fork();
-    if (hotspot_pid == 0) {
-        // In child: redirect output and run hotspot.
-        freopen("/dev/null", "w", stdout);
-        freopen("/dev/null", "w", stderr);
-        run_hotspot();
+    if (hotspot_pid < 0) {
+        newtWinMessage("Error", "Fork Failed", "Failed to fork hotspot process.");
+    } else if (hotspot_pid == 0) {
+        // Child process: run the hotspot daemon.
+        hotspot_daemon_main();
         exit(0);
-    } else if (hotspot_pid < 0) {
-        mvprintw(2, 2, "Failed to start hotspot.");
-        getch();
     } else {
-        attron(COLOR_PAIR(2));
-        mvprintw(2, 2, "Hotspot started successfully (PID: %d).", hotspot_pid);
-        attroff(COLOR_PAIR(2));
-        mvprintw(4, 2, "Press any key to return to menu...");
-        getch();
+        newtWinMessage("Hotspot", "Started", "Hotspot started in background.");
     }
 }
 
-// Stop the hotspot process.
-void stop_hotspot_tui() {
-    if (hotspot_pid <= 0) {
-        mvprintw(2, 2, "Hotspot is not running.");
-        mvprintw(4, 2, "Press any key to return to menu...");
-        getch();
-        return;
-    }
-    kill(hotspot_pid, SIGTERM);
-    waitpid(hotspot_pid, NULL, 0);
-    mvprintw(2, 2, "Hotspot stopped successfully.");
-    hotspot_pid = -1;
-    mvprintw(4, 2, "Press any key to return to menu...");
-    getch();
-}
-
-// Parent process signal handler for Ctrl+C.
-void parent_sigint_handler(int sig) {
+// Stop the hotspot daemon.
+void stop_hotspot() {
     if (hotspot_pid > 0) {
-        kill(hotspot_pid, SIGTERM);
-        waitpid(hotspot_pid, NULL, 0);
-        hotspot_pid = -1;
+        if (kill(hotspot_pid, SIGTERM) == 0) {
+            waitpid(hotspot_pid, NULL, 0);
+            newtWinMessage("Hotspot", "Stopped", "Hotspot stopped.");
+            hotspot_pid = -1;
+        } else {
+            newtWinMessage("Hotspot", "Error", "Failed to stop hotspot.");
+        }
+    } else {
+        newtWinMessage("Hotspot", "Not Running", "Hotspot is not running.");
     }
-    endwin();
-    exit(0);
 }
 
-// --- Main TUI Loop ---
-int main() {
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
+// Placeholder for hotspot configuration.
+void config_hotspot() {
+    newtWinMessage("Hotspot", "Config", "Hotspot configuration not implemented.");
+}
 
-    // Set parent process signal handler for Ctrl+C.
-    signal(SIGINT, parent_sigint_handler);
+//----------------------
+// Main Function (TUI)
+//----------------------
+int main(void) {
+    newtComponent btnStart, btnStop, btnConfig, btnQuit, form;
+    struct newtExitStruct es;
 
-    if (has_colors()) {
-        start_color();
-        init_pair(1, COLOR_WHITE, COLOR_BLUE);   // Border and title
-        init_pair(2, COLOR_YELLOW, COLOR_BLACK);   // Status messages
-        init_pair(3, COLOR_GREEN, COLOR_BLACK);    // Menu highlight
-    }
+    // Initialize newt and clear the screen.
+    newtInit();
+    newtCls();
 
-    const char *menu_items[] = {
-        "Start Hotspot",
-        "Stop Hotspot",
-        "Configure Hotspot",
-        "Exit"
-    };
-    int num_items = sizeof(menu_items) / sizeof(menu_items[0]);
-    int highlight = 0;
-    int choice;
-    int ch;
+    // Create a form without a centered window.
+    form = newtForm(NULL, NULL, 0);
 
+    // Create buttons.
+    btnStart = newtButton(10, 3, "Start Hotspot");
+    btnStop = newtButton(10, 6, "Stop Hotspot");
+    btnConfig = newtButton(10, 9, "Config Hotspot");
+    btnQuit = newtButton(10, 12, "Quit");
+
+    // Add buttons to the form.
+    newtFormAddComponents(form, btnStart, btnStop, btnConfig, btnQuit, NULL);
+
+    // Main event loop.
     while (1) {
-        clear();
-        // Draw border with title
-        attron(COLOR_PAIR(1));
-        box(stdscr, 0, 0);
-        mvprintw(0, 3, " WiFi & Hotspot Manager ");
-        attroff(COLOR_PAIR(1));
-
-        // Draw menu items in a grid style (centered)
-        for (int i = 0; i < num_items; i++) {
-            int y = 3 + i * 2;
-            int x = 4;
-            if (i == highlight) {
-                attron(A_REVERSE | COLOR_PAIR(3));
-                mvprintw(y, x, "%s", menu_items[i]);
-                attroff(A_REVERSE | COLOR_PAIR(3));
-            } else {
-                mvprintw(y, x, "%s", menu_items[i]);
-            }
-        }
-        refresh();
-
-        ch = getch();
-        switch (ch) {
-            case KEY_UP:
-                highlight--;
-                if (highlight < 0)
-                    highlight = num_items - 1;
-                break;
-            case KEY_DOWN:
-                highlight++;
-                if (highlight >= num_items)
-                    highlight = 0;
-                break;
-            case 10:  // Enter key
-                choice = highlight;
-                if (choice == 0) {       // Start Hotspot
-                    start_hotspot_tui();
-                } else if (choice == 1) {  // Stop Hotspot
-                    stop_hotspot_tui();
-                } else if (choice == 2) {  // Configure Hotspot
-                    configure_hotspot_tui();
-                } else if (choice == 3) {  // Exit
-                    // Confirm exit if hotspot is running.
-                    if (hotspot_pid > 0) {
-                        clear();
-                        box(stdscr, 0, 0);
-                        mvprintw(2, 2, "Hotspot is still running (PID: %d).", hotspot_pid);
-                        mvprintw(4, 2, "Stop hotspot and exit? (y/n): ");
-                        refresh();
-                        int confirm = getch();
-                        if (confirm == 'y' || confirm == 'Y') {
-                            kill(hotspot_pid, SIGTERM);
-                            waitpid(hotspot_pid, NULL, 0);
-                            hotspot_pid = -1;
-                            endwin();
-                            exit(0);
-                        }
-                    } else {
-                        endwin();
-                        exit(0);
-                    }
-                }
-                break;
-            default:
-                break;
+        newtFormRun(form, &es);
+        if (es.u.co == btnStart) {
+            start_hotspot();
+        } else if (es.u.co == btnStop) {
+            stop_hotspot();
+        } else if (es.u.co == btnConfig) {
+            config_hotspot();
+        } else if (es.u.co == btnQuit) {
+            // Quit without stopping any running hotspot.
+            break;
         }
     }
-    endwin();
+
+    newtFinished();
     return 0;
 }
-
+ 
