@@ -10,6 +10,7 @@
 #define HOSTAPD_CONF "/tmp/hostapd.conf"
 #define AP_IP "192.168.4.1/24"
 #define DHCP_RANGE "192.168.4.2,192.168.4.100,12h"
+#define CONFIG_FILE "/tmp/hotspot.conf" // file to persist SSID and password
 
 pid_t hostapd_pid = -1;
 
@@ -70,8 +71,201 @@ int check_ap_ip(const char *ip_path) {
   return ok;
 }
 
+// Retrieve saved Wi-Fi connection names (assumed to match SSIDs)
+char **get_saved_connections(const char *nmcli_path, int *count) {
+  char *saved = exec_cmd("nmcli -t -f NAME connection show");
+  if (!saved) {
+    *count = 0;
+    return NULL;
+  }
+  int lines = 0;
+  for (char *p = saved; *p; p++) {
+    if (*p == '\n')
+      lines++;
+  }
+  char **list = malloc(sizeof(char *) * lines);
+  if (!list) {
+    free(saved);
+    *count = 0;
+    return NULL;
+  }
+  int idx = 0;
+  char *line = strtok(saved, "\n");
+  while (line && idx < lines) {
+    list[idx] = strdup(line);
+    idx++;
+    line = strtok(NULL, "\n");
+  }
+  *count = idx;
+  free(saved);
+  return list;
+}
+
+// Retrieve available Wi-Fi networks: returns an array of structures (SSID and
+// signal)
+typedef struct {
+  char ssid[128];
+  int signal;
+} WifiEntry;
+
+WifiEntry *get_available_networks(const char *nmcli_path, int *count) {
+  char *output = exec_cmd("nmcli -t -f SSID,SIGNAL device wifi list");
+  if (!output) {
+    *count = 0;
+    return NULL;
+  }
+  if (strlen(output) == 0) {
+    fprintf(
+        stderr,
+        "Warning: 'nmcli device wifi list' returned empty. "
+        "Your device/driver may not support scanning in AP mode on this OS.\n");
+    *count = 0;
+    free(output);
+    return NULL;
+  }
+  int lines = 0;
+  for (char *p = output; *p; p++) {
+    if (*p == '\n')
+      lines++;
+  }
+  WifiEntry *networks = malloc(sizeof(WifiEntry) * lines);
+  if (!networks) {
+    free(output);
+    *count = 0;
+    return NULL;
+  }
+  int idx = 0;
+  char *line = strtok(output, "\n");
+  while (line && idx < lines) {
+    char *colon = strchr(line, ':');
+    if (colon) {
+      *colon = '\0';
+      strncpy(networks[idx].ssid, line, sizeof(networks[idx].ssid) - 1);
+      networks[idx].ssid[sizeof(networks[idx].ssid) - 1] = '\0';
+      networks[idx].signal = atoi(colon + 1);
+      idx++;
+    }
+    line = strtok(NULL, "\n");
+  }
+  *count = idx;
+  free(output);
+  return networks;
+}
+
+// Automatically switch to the best saved Wi-Fi (highest signal)
+// Returns 0 on success, nonzero on failure.
+int auto_switch_wifi(const char *nmcli_path) {
+  int savedCount = 0, availCount = 0;
+  char **saved = get_saved_connections(nmcli_path, &savedCount);
+  if (savedCount == 0) {
+    fprintf(stderr, "No saved Wi-Fi connections found.\n");
+    return 1;
+  }
+  WifiEntry *avail = get_available_networks(nmcli_path, &availCount);
+  if (availCount == 0) {
+    fprintf(stderr, "No available Wi-Fi networks detected. Auto-switching is "
+                    "not supported on this system.\n");
+    for (int i = 0; i < savedCount; i++)
+      free(saved[i]);
+    free(saved);
+    return 1;
+  }
+  int bestSignal = -1;
+  char bestSSID[128] = "";
+  for (int i = 0; i < availCount; i++) {
+    if (strlen(avail[i].ssid) == 0)
+      continue;
+    for (int j = 0; j < savedCount; j++) {
+      if (strcmp(avail[i].ssid, saved[j]) == 0) {
+        if (avail[i].signal > bestSignal) {
+          bestSignal = avail[i].signal;
+          strncpy(bestSSID, avail[i].ssid, sizeof(bestSSID) - 1);
+          bestSSID[sizeof(bestSSID) - 1] = '\0';
+        }
+        break;
+      }
+    }
+  }
+  for (int i = 0; i < savedCount; i++)
+    free(saved[i]);
+  free(saved);
+  free(avail);
+
+  if (bestSignal == -1) {
+    fprintf(stderr, "No known Wi-Fi networks are currently in range.\n");
+    return 1;
+  }
+  printf("Best candidate found: \"%s\" with signal strength %d\n", bestSSID,
+         bestSignal);
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), "sudo %s con up \"%s\"", nmcli_path, bestSSID);
+  printf("Attempting to connect to \"%s\"...\n", bestSSID);
+  if (system(cmd) != 0) {
+    fprintf(stderr, "Failed to activate connection for \"%s\".\n", bestSSID);
+    return 1;
+  }
+  sleep(2);
+  if (system("ping -c 2 google.com >/dev/null 2>&1") != 0) {
+    fprintf(
+        stderr,
+        "Connection attempt to \"%s\" did not restore internet connectivity.\n",
+        bestSSID);
+    return 1;
+  } else {
+    printf("Reconnected to \"%s\" successfully!\n", bestSSID);
+  }
+  return 0;
+}
+
+// Check if systemd-resolved is active and warn the user.
+void check_systemd_resolved() {
+  if (system("systemctl is-active --quiet systemd-resolved") == 0) {
+    fprintf(stderr, "Warning: systemd-resolved is active. It may conflict with "
+                    "dnsmasq on port 53.\n");
+  }
+}
+
+// Function to load hotspot configuration (SSID and password) from file,
+// or prompt the user if not present.
+void load_hotspot_config(char *ssid, size_t ssid_len, char *pass,
+                         size_t pass_len) {
+  FILE *config = fopen(CONFIG_FILE, "r");
+  if (config) {
+    if (fgets(ssid, ssid_len, config) != NULL) {
+      ssid[strcspn(ssid, "\n")] = '\0';
+    }
+    if (fgets(pass, pass_len, config) != NULL) {
+      pass[strcspn(pass, "\n")] = '\0';
+    }
+    fclose(config);
+    printf("Using saved hotspot configuration:\n  SSID: %s\n", ssid);
+  } else {
+    printf("Enter SSID for hotspot: ");
+    if (!fgets(ssid, ssid_len, stdin)) {
+      fprintf(stderr, "Error reading SSID\n");
+      exit(1);
+    }
+    ssid[strcspn(ssid, "\n")] = '\0';
+
+    printf("Enter Password for hotspot: ");
+    if (!fgets(pass, pass_len, stdin)) {
+      fprintf(stderr, "Error reading Password\n");
+      exit(1);
+    }
+    pass[strcspn(pass, "\n")] = '\0';
+    printf("\n");
+    config = fopen(CONFIG_FILE, "w");
+    if (!config) {
+      perror("fopen config file for writing");
+      exit(1);
+    }
+    fprintf(config, "%s\n%s\n", ssid, pass);
+    fclose(config);
+  }
+}
+
 // Cleanup function to be called on SIGINT/SIGTERM.
-void cleanup(int sig) {
+void cleanup_handler(int sig) {
   printf("\nStopping hotspot...\n");
   if (hostapd_pid > 0) {
     kill(hostapd_pid, SIGTERM);
@@ -84,8 +278,8 @@ void cleanup(int sig) {
 }
 
 int main(void) {
-  signal(SIGINT, cleanup);
-  signal(SIGTERM, cleanup);
+  signal(SIGINT, cleanup_handler);
+  signal(SIGTERM, cleanup_handler);
 
   // Increase file descriptor limit.
   struct rlimit rl;
@@ -94,7 +288,7 @@ int main(void) {
     setrlimit(RLIMIT_NOFILE, &rl);
   }
 
-  // Fetch full paths for all required commands.
+  // Fetch full paths for required commands.
   char *iw_path = get_cmd_path("iw");
   char *hostapd_path = get_cmd_path("hostapd");
   char *dnsmasq_path = get_cmd_path("dnsmasq");
@@ -118,7 +312,9 @@ int main(void) {
   printf("ip:         %s\n", ip_path);
   printf("iptables:   %s\n", iptables_path);
 
-  // Automatically fetch the connected WLAN interface using nmcli.
+  check_systemd_resolved();
+
+  // Fetch the connected WLAN interface using nmcli.
   char *wlan_iface = exec_cmd("nmcli -t -f DEVICE,TYPE,STATE dev status | grep "
                               "':wifi:connected' | cut -d: -f1 | head -n1");
   if (!wlan_iface || strlen(wlan_iface) == 0) {
@@ -128,22 +324,22 @@ int main(void) {
   wlan_iface[strcspn(wlan_iface, "\n")] = '\0';
   printf("Detected connected WLAN interface: %s\n", wlan_iface);
 
-  // Prompt user for SSID and Password.
+  // Load hotspot configuration (SSID and password) from file or prompt.
   char ssid[128], pass[128];
-  printf("Enter SSID for hotspot: ");
-  if (!fgets(ssid, sizeof(ssid), stdin)) {
-    fprintf(stderr, "Error reading SSID\n");
-    exit(1);
-  }
-  ssid[strcspn(ssid, "\n")] = '\0';
+  load_hotspot_config(ssid, sizeof(ssid), pass, sizeof(pass));
 
-  printf("Enter Password for hotspot: ");
-  if (!fgets(pass, sizeof(pass), stdin)) {
-    fprintf(stderr, "Error reading Password\n");
-    exit(1);
+  // Prompt for connectivity check interval.
+  int check_interval = 10; // default seconds
+  char interval_input[16];
+  printf("Enter connectivity check interval in seconds [default 10]: ");
+  if (fgets(interval_input, sizeof(interval_input), stdin) != NULL) {
+    if (interval_input[0] != '\n') {
+      check_interval = atoi(interval_input);
+      if (check_interval <= 0)
+        check_interval = 10;
+    }
   }
-  pass[strcspn(pass, "\n")] = '\0';
-  printf("\n");
+  printf("Using connectivity check interval: %d seconds\n", check_interval);
 
   // Start NetworkManager.
   char nmcli_start[256];
@@ -239,21 +435,11 @@ int main(void) {
            nmcli_path, AP_IFACE);
   system(nmcliSet);
 
-  // Check internet connectivity.
+  // Initial internet connectivity check.
   printf("Checking internet connectivity...\n");
-  if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
-    char upConn[256];
-    snprintf(upConn, sizeof(upConn), "sudo %s con up \"%s\"", nmcli_path,
-             connection);
-    printf("Internet appears down; attempting to reconnect...\n");
-    system(upConn);
-    sleep(2);
-    if (system("ping -c 2 8.8.8.8 >/dev/null 2>&1") != 0) {
-      fprintf(stderr, "Failed to restore internet connection.\n");
-      char delCmd2[128];
-      snprintf(delCmd2, sizeof(delCmd2), "sudo %s dev %s del", iw_path,
-               AP_IFACE);
-      system(delCmd2);
+  if (system("ping -c 2 google.com >/dev/null 2>&1") != 0) {
+    if (auto_switch_wifi(nmcli_path) != 0) {
+      fprintf(stderr, "Initial reconnection failed.\n");
       exit(1);
     }
   }
@@ -294,7 +480,6 @@ int main(void) {
     perror("execlp hostapd failed");
     exit(1);
   }
-  sleep(2);
   if (kill(hostapd_pid, 0) != 0) {
     fprintf(stderr, "hostapd failed to start. Configuration:\n");
     system("cat " HOSTAPD_CONF);
@@ -314,24 +499,32 @@ int main(void) {
            AP_IFACE);
   system(linkCmd);
 
-  // Check that the AP interface has the correct IP.
   if (!check_ap_ip(ip_path)) {
     fprintf(stderr, "AP interface %s did not receive the correct IP address.\n",
             AP_IFACE);
     exit(1);
   }
 
-  // Start dnsmasq for DHCP.
+  // Start dnsmasq for DHCP, binding only to the hotspot's IP.
   char dnsCmd[256];
-  snprintf(dnsCmd, sizeof(dnsCmd), "sudo %s --interface=%s --dhcp-range=%s &",
+  snprintf(dnsCmd, sizeof(dnsCmd),
+           "sudo %s --interface=%s --bind-interfaces "
+           "--listen-address=192.168.4.1 --dhcp-range=%s &",
            dnsmasq_path, AP_IFACE, DHCP_RANGE);
   system(dnsCmd);
-  sleep(2);
-  if (!check_dnsmasq_running(dnsmasq_path)) {
+
+  int retry = 3;
+  while (retry-- > 0) {
+    sleep(2);
+    if (check_dnsmasq_running(dnsmasq_path)) {
+      printf("dnsmasq is running and DHCP is enabled.\n");
+      break;
+    }
+    printf("Waiting for dnsmasq to start...\n");
+  }
+  if (retry < 0) {
     fprintf(stderr, "dnsmasq is not running. DHCP will not work.\n");
     exit(1);
-  } else {
-    printf("dnsmasq is running and DHCP is enabled.\n");
   }
 
   // Enable NAT for internet sharing.
@@ -357,7 +550,15 @@ int main(void) {
   printf("Press Ctrl+C to stop.\n");
 
   while (1) {
-    pause();
+    sleep(check_interval);
+    if (system("ping -c 2 google.com >/dev/null 2>&1") != 0) {
+      printf("Internet connectivity lost. Attempting automatic switch...\n");
+      if (auto_switch_wifi(nmcli_path) != 0) {
+        fprintf(stderr, "Automatic switching failed. Retrying...\n");
+      }
+    } else {
+      printf("Internet connection stable.\n");
+    }
   }
 
   free(iw_path);
