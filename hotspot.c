@@ -5,7 +5,6 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
 #define AP_IFACE "ap0"
 #define HOSTAPD_CONF "/tmp/hostapd.conf"
 #define AP_IP "192.168.4.1/24"
@@ -399,13 +398,6 @@ int main(void) {
   }
   printf("Primary connection - Channel: %s, Frequency: %s MHz\n", channel,
          freq);
-
-  int freqVal = atoi(freq);
-  if (freqVal < 5000) {
-    fprintf(stderr, "Error: Primary connection is on 2.4 GHz. Please use a 5 "
-                    "GHz network or a separate adapter for the hotspot.\n");
-    exit(1);
-  }
 
   const char *hw_mode = "a";
   printf("Using hardware mode: %s\n", hw_mode);
