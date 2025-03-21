@@ -1,3 +1,4 @@
+
 #include <ncurses.h>
 #include <signal.h>
 #include <stdio.h>
@@ -252,6 +253,7 @@ void cleanup_handler(int sig) {
 }
 
 // --- Hotspot Process Function ---
+// This function contains your original hotspot setup/monitoring logic.
 void run_hotspot() {
   signal(SIGINT, cleanup_handler);
   signal(SIGTERM, cleanup_handler);
@@ -325,8 +327,6 @@ void run_hotspot() {
   }
   printf("Connected via: %s", connection);
 
-  // --- Modified: Fetch channel and frequency, determine GHz band and hw_mode
-  // ---
   char iwCmd[256];
   snprintf(iwCmd, sizeof(iwCmd), "%s dev %s info", iw_path, wlan_iface);
   char *wlanInfo = exec_cmd(iwCmd);
@@ -340,7 +340,6 @@ void run_hotspot() {
     char *line = strtok(wlanInfo, "\n");
     while (line) {
       if (strstr(line, "channel")) {
-        // Expected line: " channel 36 (5180 MHz)"
         sscanf(line, " channel %15s", channel);
         char *paren = strchr(line, '(');
         if (paren) {
@@ -363,40 +362,15 @@ void run_hotspot() {
          freq);
 
   int freqVal = atoi(freq);
-  // Determine hardware mode based on frequency.
-  // If freq < 5000, assume 2.4 GHz and use "g", otherwise 5 GHz with "a".
-  const char *hw_mode = (freqVal < 5000) ? "g" : "a";
+  if (freqVal < 5000) {
+    fprintf(stderr, "Error: Primary connection is on 2.4 GHz. Please use a 5 "
+                    "GHz network or a separate adapter for the hotspot.\n");
+    exit(1);
+  }
+
+  const char *hw_mode = "a";
   printf("Using hardware mode: %s\n", hw_mode);
 
-  // Additional edge-case handling: Validate the channel number.
-  if (hw_mode[0] == 'g') {
-    // For 2.4 GHz, valid channels are typically 1-14.
-    int ch = atoi(channel);
-    if (ch < 1 || ch > 14) {
-      fprintf(stderr,
-              "Detected 2.4 GHz channel %d is out of expected range (1-14). "
-              "Defaulting to channel 6.\n",
-              ch);
-      strncpy(channel, "6", sizeof(channel) - 1);
-    }
-  } else {
-    // For 5 GHz, valid channels are usually between 36 and 165.
-    int ch = atoi(channel);
-    if (ch < 36 || ch > 165) {
-      fprintf(stderr,
-              "Detected 5 GHz channel %d is out of expected range (36-165). "
-              "Defaulting to channel 36.\n",
-              ch);
-      strncpy(channel, "36", sizeof(channel) - 1);
-    }
-  }
-  printf("Hotspot will be created on channel %s (%s band).\n", channel,
-         (hw_mode[0] == 'g') ? "2.4 GHz" : "5 GHz");
-  // --- End Modified Section ---
-
-  free(connection);
-
-  // Remove any existing AP interface.
   char checkAP[128];
   snprintf(checkAP, sizeof(checkAP), "sudo %s dev %s info >/dev/null 2>&1",
            iw_path, AP_IFACE);
@@ -407,7 +381,6 @@ void run_hotspot() {
     system(delCmd);
   }
 
-  // Create the AP interface.
   char addIf[256];
   snprintf(addIf, sizeof(addIf), "sudo %s dev %s interface add %s type __ap",
            iw_path, wlan_iface, AP_IFACE);
@@ -428,6 +401,7 @@ void run_hotspot() {
       exit(1);
     }
   }
+  free(connection);
 
   printf("Configuring hostapd...\n");
   FILE *fp = fopen(HOSTAPD_CONF, "w");
@@ -594,20 +568,16 @@ void configure_hotspot_tui() {
     mvprintw(10, 2, "Error updating configuration!");
   }
   mvprintw(12, 2, "Press any key to return to menu...");
-  refresh();
   getch();
 }
 
 // Start the hotspot process.
 void start_hotspot_tui() {
   if (hotspot_pid > 0) {
-    clear();
-    box(stdscr, 0, 0);
     attron(COLOR_PAIR(2));
     mvprintw(2, 2, "Hotspot is already running (PID: %d).", hotspot_pid);
     attroff(COLOR_PAIR(2));
     mvprintw(4, 2, "Press any key to return to menu...");
-    refresh();
     getch();
     return;
   }
@@ -619,17 +589,13 @@ void start_hotspot_tui() {
     run_hotspot();
     exit(0);
   } else if (hotspot_pid < 0) {
-    clear();
     mvprintw(2, 2, "Failed to start hotspot.");
-    refresh();
     getch();
   } else {
-    clear();
     attron(COLOR_PAIR(2));
     mvprintw(2, 2, "Hotspot started successfully (PID: %d).", hotspot_pid);
     attroff(COLOR_PAIR(2));
     mvprintw(4, 2, "Press any key to return to menu...");
-    refresh();
     getch();
   }
 }
@@ -637,22 +603,16 @@ void start_hotspot_tui() {
 // Stop the hotspot process.
 void stop_hotspot_tui() {
   if (hotspot_pid <= 0) {
-    clear();
-    box(stdscr, 0, 0);
     mvprintw(2, 2, "Hotspot is not running.");
     mvprintw(4, 2, "Press any key to return to menu...");
-    refresh();
     getch();
     return;
   }
   kill(hotspot_pid, SIGTERM);
   waitpid(hotspot_pid, NULL, 0);
-  clear();
-  box(stdscr, 0, 0);
   mvprintw(2, 2, "Hotspot stopped successfully.");
   hotspot_pid = -1;
   mvprintw(4, 2, "Press any key to return to menu...");
-  refresh();
   getch();
 }
 
@@ -734,6 +694,7 @@ int main() {
       } else if (choice == 2) { // Configure Hotspot
         configure_hotspot_tui();
       } else if (choice == 3) { // Exit
+        // Confirm exit if hotspot is running.
         if (hotspot_pid > 0) {
           clear();
           box(stdscr, 0, 0);
