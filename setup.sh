@@ -1,135 +1,76 @@
 #!/bin/bash
-# setup.sh – Setup script to install dependencies, stop conflicts, clean up interfaces,
-# disable Wi-Fi power saving, and compile the hotspot program from source file "my.c"
-# to output binary "myc".
+# A comprehensive setup script to install dependencies, build, and optionally install the project.
 
-set -e
-
-# Function to install packages using available package manager.
-install_packages() {
-    packages="$@"
-    if command -v apt-get >/dev/null 2>&1; then
-        echo "Using apt-get to install: $packages"
-        sudo apt-get update
-        sudo apt-get install -y $packages
-    elif command -v dnf >/dev/null 2>&1; then
-        echo "Using dnf to install: $packages"
-        sudo dnf install -y $packages
-    elif command -v pacman >/dev/null 2>&1; then
-        echo "Using pacman to install: $packages"
-        sudo pacman -Sy --noconfirm $packages
-    elif [[ "$(uname)" == "Darwin" ]]; then
-        if ! command -v brew >/dev/null 2>&1; then
-            echo "Homebrew not found. Please install Homebrew from https://brew.sh/ and rerun this script."
-            exit 1
-        fi
-        echo "Using brew to install: $packages"
-        brew update
-        brew install $packages
-    else
-        echo "No supported package manager found. Please install the following packages manually: $packages"
-        exit 1
-    fi
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
 }
 
-# List of required commands and corresponding package names.
-declare -A REQUIRED_CMDS
-REQUIRED_CMDS=(
-  [iw]="iw"
-  [hostapd]="hostapd"
-  [dnsmasq]="dnsmasq"
-  [nmcli]="network-manager"
-  [systemctl]="systemd"   # Typically part of systemd
-  [ip]="iproute2"
-  [iptables]="iptables"
-  [gcc]="gcc"
-)
-
-# Check for missing commands.
-MISSING_PACKAGES=()
-for cmd in "${!REQUIRED_CMDS[@]}"; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "Command '$cmd' not found. It is provided by package '${REQUIRED_CMDS[$cmd]}'."
-        MISSING_PACKAGES+=("${REQUIRED_CMDS[$cmd]}")
-    fi
-done
-
-if [ ${#MISSING_PACKAGES[@]} -gt 0 ]; then
-    echo "Installing missing packages: ${MISSING_PACKAGES[*]}"
-    install_packages "${MISSING_PACKAGES[@]}"
-fi
-
-# Stop systemd-resolved to avoid conflict with dnsmasq on port 53 (Linux only).
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved; then
-    echo "Stopping and disabling systemd-resolved (it may conflict with dnsmasq)..."
-    sudo systemctl stop systemd-resolved
-    sudo systemctl disable systemd-resolved
-fi
-
-# Ensure port 53 is free (both TCP and UDP) on Linux.
-if command -v fuser >/dev/null 2>&1; then
-    echo "Freeing port 53..."
-    sudo fuser -k 53/tcp 2>/dev/null || true
-    sudo fuser -k 53/udp 2>/dev/null || true
-fi
-
-# Disable Wi-Fi power saving to avoid disconnections (Linux specific).
-if [[ "$(uname)" != "Darwin" ]]; then
-    echo "Disabling Wi-Fi power saving..."
-    CONF_FILE="/etc/NetworkManager/conf.d/default-wifi-powersave-on.conf"
-    sudo mkdir -p "$(dirname $CONF_FILE)"
-    sudo tee "$CONF_FILE" >/dev/null <<EOF
-[connection]
-wifi.powersave = 2
-EOF
-    # Restart NetworkManager to apply changes.
-    if command -v systemctl >/dev/null 2>&1; then
-        sudo systemctl restart NetworkManager
-    fi
-fi
-
-# Clean up any leftover AP interface (ap0) on Linux.
-if command -v ip >/dev/null 2>&1 && ip link show ap0 >/dev/null 2>&1; then
-    echo "Interface ap0 already exists. Deleting it..."
-    sudo ip link delete ap0
-fi
-
-# Optionally verify that the wireless device supports AP mode.
-if command -v iw >/dev/null 2>&1; then
-    echo "Verifying wireless device supports AP mode..."
-    if ! iw list | grep -q "AP"; then
-        echo "Warning: Your wireless device may not support AP mode."
-        echo "Please check 'iw list' to confirm supported interface modes."
-    fi
-fi
-
-# Compile the C program from my.c to output binary myc.
-if [ ! -f my.c ]; then
-    echo "Source file my.c not found in the current directory."
+# Check for required commands
+if ! command_exists gcc; then
+    echo "Error: gcc is not installed. Please install gcc."
     exit 1
 fi
 
-echo "Compiling my.c..."
-# Here, we assume the target binary is uic (as per your compile command).
-gcc -o uic ui.c -lncurses
-echo "Compilation successful."
+# Check for ncurses development files
+if [ ! -f /usr/include/ncurses.h ] && [ ! -f /usr/include/ncurses/ncurses.h ]; then
+    echo "ncurses development files not found."
 
-cat <<EOF
+    # Try to install based on available package manager
+    if command_exists apt-get; then
+        echo "Attempting to install libncurses-dev via apt-get..."
+        sudo apt-get update && sudo apt-get install -y libncurses-dev
+    elif command_exists dnf; then
+        echo "Attempting to install ncurses-devel via dnf..."
+        sudo dnf install -y ncurses-devel
+    elif command_exists yum; then
+        echo "Attempting to install ncurses-devel via yum..."
+        sudo yum install -y ncurses-devel
+    elif command_exists pacman; then
+        echo "Attempting to install ncurses via pacman..."
+        sudo pacman -S --noconfirm ncurses
+    elif command_exists brew; then
+        echo "Attempting to install ncurses via brew..."
+        brew install ncurses
+    else
+        echo "No supported package manager found. Please install the ncurses development library manually."
+        exit 1
+    fi
 
-Setup complete.
-You can now run the hotspot program (it requires root privileges):
-  sudo ./myc
+    # Re-check for ncurses after installation attempt
+    if [ ! -f /usr/include/ncurses.h ] && [ ! -f /usr/include/ncurses/ncurses.h ]; then
+        echo "Error: ncurses development files are still missing after attempted installation."
+        exit 1
+    fi
+fi
 
-This program will:
- - Start NetworkManager and create a hotspot with the provided SSID and password.
- - Continuously monitor internet connectivity using ping.
- - Automatically switch to the best available saved Wi-Fi network if connectivity is lost.
+# Compile hotspot.c to produce hsc
+echo "Compiling hotspot.c to create hsc..."
+if ! gcc -o hsc hotspot.c -lncurses; then
+    echo "Error: Compilation of hotspot.c failed."
+    exit 1
+fi
 
-EOF
+# Optionally compile ui.c if it exists to produce uic
+if [ -f ui.c ]; then
+    echo "Compiling ui.c to create uic..."
+    if ! gcc -o uic ui.c -lncurses; then
+        echo "Error: Compilation of ui.c failed."
+        exit 1
+    fi
+fi
 
-# Re-enable systemd-resolved (Linux only).
-if command -v systemctl >/dev/null 2>&1; then
-    sudo systemctl enable systemd-resolved
-    sudo systemctl start systemd-resolved
-    sudo systemctl restart NetworkManager
+echo "Build successful."
+
+# Optional installation step
+read -p "Do you want to install the executables to /usr/local/bin? [y/N] " install_choice
+if [[ "$install_choice" =~ ^[Yy]$ ]]; then
+    echo "Installing executables..."
+    sudo cp hsc /usr/local/bin/ || { echo "Error: Failed to install hsc."; exit 1; }
+    if [ -f uic ]; then
+        sudo cp uic /usr/local/bin/ || { echo "Error: Failed to install uic."; exit 1; }
+    fi
+    echo "Installation successful."
+else
+    echo "Installation skipped."
 fi
