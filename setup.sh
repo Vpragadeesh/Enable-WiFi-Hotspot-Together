@@ -1,5 +1,6 @@
 #!/bin/bash
 # A comprehensive setup script to install dependencies, build, and optionally install the project.
+# This version offers an option to compile statically to improve portability across Linux systems.
 
 # Function to check if a command exists
 command_exists() {
@@ -12,7 +13,7 @@ if ! command_exists gcc; then
     exit 1
 fi
 
-# Check for ncurses development files
+# Check for ncurses development files (dynamic version)
 if [ ! -f /usr/include/ncurses.h ] && [ ! -f /usr/include/ncurses/ncurses.h ]; then
     echo "ncurses development files not found."
 
@@ -44,9 +45,24 @@ if [ ! -f /usr/include/ncurses.h ] && [ ! -f /usr/include/ncurses/ncurses.h ]; t
     fi
 fi
 
+# Option for static linking to improve portability
+read -p "Do you want to compile with static linking? (Requires static libraries, may not work with glibc fully) [y/N] " static_choice
+if [[ "$static_choice" =~ ^[Yy]$ ]]; then
+    # Check for the static ncurses library; path may vary by distribution.
+    if [ -f /usr/lib/libncurses.a ] || [ -f /usr/lib/x86_64-linux-gnu/libncurses.a ]; then
+        STATIC_FLAG="-static"
+        echo "Static libraries found. Compiling statically..."
+    else
+        echo "Static library for ncurses not found. Falling back to dynamic linking."
+        STATIC_FLAG=""
+    fi
+else
+    STATIC_FLAG=""
+fi
+
 # Compile hotspot.c to produce hsc
 echo "Compiling hotspot.c to create hsc..."
-if ! gcc -o hsc hotspot.c -lncurses; then
+if ! gcc $STATIC_FLAG -o hsc hotspot.c -lncurses; then
     echo "Error: Compilation of hotspot.c failed."
     exit 1
 fi
@@ -54,7 +70,7 @@ fi
 # Optionally compile ui.c if it exists to produce uic
 if [ -f ui.c ]; then
     echo "Compiling ui.c to create uic..."
-    if ! gcc -o uic ui.c -lncurses; then
+    if ! gcc $STATIC_FLAG -o uic ui.c -lncurses; then
         echo "Error: Compilation of ui.c failed."
         exit 1
     fi
